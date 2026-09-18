@@ -414,4 +414,187 @@ def ship_mix(ship: str):
     return {"ship": ship, "monthly": monthly}
 
 
+# ---------------------------------------------------------------------------
+# Net credits earned per session (functional-requirements.md 2.3). This is
+# deliberately isolated as its own reusable CTE fragment -- 2.8's Session
+# Spotlights tab (built later, by someone else) needs this exact per-session
+# credit-delta logic and must NOT reimplement it.
+#
+# Sums a per-event-type credit_delta, grouped by session (source_file):
+#   Bounty                   +TotalReward
+#   FactionKillBond           +Reward
+#   MissionCompleted          +Reward
+#   MarketSell                +TotalSale
+#   MarketBuy                 -TotalCost
+#   SellExplorationData       +(BaseValue + Bonus)
+#   MultiSellExplorationData  +TotalEarnings
+#   RedeemVoucher              +Amount
+#   SellOrganicData            +sum over BioData[] of (Value + Bonus)
+# Every raw field is COALESCE'd to 0 -- a missing/null field (e.g. Bonus,
+# which isn't always present) must not null out that event's contribution,
+# which would otherwise poison the whole session's SUM() to NULL.
+#
+# This is a fragment of CTE bodies (no leading "WITH", no trailing comma) --
+# splice it into a query's WITH clause, e.g.:
+#   f"WITH {SESSION_NET_CREDITS_CTE} SELECT * FROM session_net_credits"
+SESSION_NET_CREDITS_CTE = """
+    session_credit_events AS (
+        SELECT source_file,
+               CASE event
+                   WHEN 'Bounty' THEN
+                       COALESCE((raw->>'TotalReward')::double precision, 0)
+                   WHEN 'FactionKillBond' THEN
+                       COALESCE((raw->>'Reward')::double precision, 0)
+                   WHEN 'MissionCompleted' THEN
+                       COALESCE((raw->>'Reward')::double precision, 0)
+                   WHEN 'MarketSell' THEN
+                       COALESCE((raw->>'TotalSale')::double precision, 0)
+                   WHEN 'MarketBuy' THEN
+                       -COALESCE((raw->>'TotalCost')::double precision, 0)
+                   WHEN 'SellExplorationData' THEN
+                       COALESCE((raw->>'BaseValue')::double precision, 0)
+                       + COALESCE((raw->>'Bonus')::double precision, 0)
+                   WHEN 'MultiSellExplorationData' THEN
+                       COALESCE((raw->>'TotalEarnings')::double precision, 0)
+                   WHEN 'RedeemVoucher' THEN
+                       COALESCE((raw->>'Amount')::double precision, 0)
+                   WHEN 'SellOrganicData' THEN (
+                       SELECT COALESCE(SUM(
+                           COALESCE((elem->>'Value')::double precision, 0)
+                           + COALESCE((elem->>'Bonus')::double precision, 0)
+                       ), 0)
+                       FROM jsonb_array_elements(raw->'BioData') elem
+                   )
+                   ELSE 0
+               END AS credit_delta
+        FROM events
+        WHERE event IN (
+            'Bounty', 'FactionKillBond', 'MissionCompleted', 'MarketSell',
+            'MarketBuy', 'SellExplorationData', 'MultiSellExplorationData',
+            'RedeemVoucher', 'SellOrganicData'
+        )
+    ),
+    session_net_credits AS (
+        SELECT source_file, SUM(credit_delta) AS net_credits
+        FROM session_credit_events
+        GROUP BY source_file
+    )
+"""
+
+# A session's dominant activity category (functional-requirements.md 2.3):
+# the category with the most events in that session, excluding Ambient --
+# the same "most events wins" rule as the Ships tab's per-ship dominant
+# category (see frontend/app.js's dominantCategories()), just computed in
+# SQL here since it feeds a GROUP BY / aggregate query rather than a chart
+# color lookup. Also a bare CTE-body fragment, same splicing convention as
+# SESSION_NET_CREDITS_CTE above.
+SESSION_DOMINANT_CATEGORY_CTE = """
+    session_category_counts AS (
+        SELECT source_file, category, COUNT(*) AS n
+        FROM events
+        WHERE category IS NOT NULL AND category != 'Ambient'
+        GROUP BY source_file, category
+    ),
+    session_dominant_category AS (
+        SELECT DISTINCT ON (source_file) source_file, category AS dominant_category
+        FROM session_category_counts
+        ORDER BY source_file, n DESC, category ASC
+    )
+"""
+
+# Valid sessions (0 < duration_hours < 12, functional-requirements.md 1.1)
+# joined against net credits and dominant category -- the shared base for
+# every Play Patterns feature below that needs per-session credit figures.
+PLAY_PATTERNS_VALID_SESSIONS_CTE = f"""
+    {SESSION_NET_CREDITS_CTE},
+    {SESSION_DOMINANT_CATEGORY_CTE},
+    valid_sessions AS (
+        SELECT s.source_file,
+               s.session_start,
+               s.duration_hours,
+               COALESCE(nc.net_credits, 0) AS net_credits,
+               COALESCE(nc.net_credits, 0) / s.duration_hours AS credits_per_hour,
+               COALESCE(dc.dominant_category, 'Other') AS dominant_category
+        FROM sessions s
+        LEFT JOIN session_net_credits nc ON nc.source_file = s.source_file
+        LEFT JOIN session_dominant_category dc ON dc.source_file = s.source_file
+        WHERE s.duration_hours > 0 AND s.duration_hours < 12
+    )
+"""
+
+
+@app.get("/api/play-patterns")
+def play_patterns():
+    # Events-per-active-hour by category -- the direct evidence for why raw
+    # event counts are a bad usage metric (functional-requirements.md 2.2/
+    # 2.3): "active hour" = distinct hour-buckets containing >=1 event of
+    # that category, so a category that fires many events per minute (e.g.
+    # Combat) isn't just winning on density.
+    tempo = query("""
+        SELECT category,
+               COUNT(*) AS events,
+               COUNT(DISTINCT date_trunc('hour', "timestamp")) AS active_hours,
+               COUNT(*)::double precision
+                   / COUNT(DISTINCT date_trunc('hour', "timestamp")) AS events_per_active_hour
+        FROM events
+        WHERE category IS NOT NULL AND category != 'Ambient'
+        GROUP BY category
+        ORDER BY events_per_active_hour DESC
+    """)
+
+    scatter = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT duration_hours, net_credits, credits_per_hour, dominant_category
+        FROM valid_sessions
+    """)
+
+    # Pearson correlation coefficients via Postgres's built-in corr(Y, X)
+    # aggregate -- functional-requirements.md 2.3 explicitly wants these
+    # computed server-side, not hand-rolled.
+    correlations = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT corr(net_credits, duration_hours) AS duration_vs_total_credits,
+               corr(credits_per_hour, duration_hours) AS duration_vs_credits_per_hour
+        FROM valid_sessions
+    """)[0]
+
+    efficiency = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT dominant_category,
+               COUNT(*) AS sessions,
+               AVG(duration_hours) AS avg_duration_hours,
+               AVG(net_credits) AS avg_net_credits,
+               AVG(credits_per_hour) AS avg_credits_per_hour,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY credits_per_hour) AS median_credits_per_hour
+        FROM valid_sessions
+        GROUP BY dominant_category
+        ORDER BY avg_credits_per_hour DESC
+    """)
+
+    top_lucrative = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT source_file, session_start, duration_hours, net_credits, dominant_category
+        FROM valid_sessions
+        ORDER BY net_credits DESC
+        LIMIT 5
+    """)
+
+    top_longest = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT source_file, session_start, duration_hours, net_credits, dominant_category
+        FROM valid_sessions
+        ORDER BY duration_hours DESC
+        LIMIT 5
+    """)
+
+    return {
+        "tempo": tempo,
+        "scatter": scatter,
+        "correlations": correlations,
+        "efficiency": efficiency,
+        "top_lucrative": top_lucrative,
+        "top_longest": top_longest,
+    }
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

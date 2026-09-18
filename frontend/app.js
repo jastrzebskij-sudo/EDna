@@ -50,6 +50,8 @@ function renderTab(id) {
     renderGameplay(panel);
   } else if (id === "ships") {
     renderShips(panel);
+  } else if (id === "play-patterns") {
+    renderPlayPatterns(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -812,6 +814,140 @@ function renderFitVsUsage(panel, data) {
     note.textContent = "No flags raised for: " + [...data.fit_clean_ships].sort().join(", ");
     div.appendChild(note);
   }
+}
+
+function renderPlayPatterns(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading play-patterns data&hellip;</p></div>`;
+  fetch("/api/play-patterns")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      renderTempo(panel, data);
+      renderDurationVsCredits(panel, data);
+      renderCreditEfficiency(panel, data);
+      renderTopSessions(panel, data);
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/play-patterns -- ${e}</p></div>`;
+    });
+}
+
+function renderTempo(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Event Tempo by Category</h2><p>Events per active hour (distinct hour-buckets containing at least one event of that category) -- the direct explanation for why raw event counts are a bad usage metric.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.tempo.length * 26));
+
+  const rows = [...data.tempo].sort((a, b) => b.events_per_active_hour - a.events_per_active_hour);
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.category),
+      datasets: [{
+        label: "Events / active hour",
+        data: rows.map((r) => r.events_per_active_hour),
+        backgroundColor: rows.map((r) => CATEGORY_COLORS[r.category] || "#888"),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { title: { display: true, text: "Events / active hour" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderDurationVsCredits(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  const c = data.correlations || {};
+  const rTotal = c.duration_vs_total_credits;
+  const rRate = c.duration_vs_credits_per_hour;
+  const fmt = (v) => (v === null || v === undefined ? "n/a" : Number(v).toFixed(2));
+  div.innerHTML = `
+    <h2>Session Duration vs. Net Credits Earned</h2>
+    <p>Each point is one valid session (0&ndash;12h), colored by its dominant activity. Log Y axis.</p>
+    <p class="ed-note">Pearson r, duration vs. total net credits: ${fmt(rTotal)} &nbsp;&middot;&nbsp;
+      duration vs. credits/hour: ${fmt(rRate)} &mdash; longer sessions don't reliably earn more, or earn faster.</p>
+  `;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, 420);
+
+  const byCategory = {};
+  data.scatter.forEach((r) => {
+    byCategory[r.dominant_category] = byCategory[r.dominant_category] || [];
+    byCategory[r.dominant_category].push({ x: r.duration_hours, y: r.net_credits });
+  });
+
+  const datasets = Object.entries(byCategory).map(([cat, points]) => ({
+    label: cat,
+    data: points,
+    backgroundColor: CATEGORY_COLORS[cat] || "#888",
+    pointRadius: 3,
+  }));
+
+  const chart = new Chart(canvas, {
+    type: "scatter",
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { title: { display: true, text: "Session duration (hours)" } },
+        y: logAxis("Net credits (log scale)"),
+      },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 10 } } },
+      },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderCreditEfficiency(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Credit Efficiency by Session's Dominant Activity</h2><p>Median credits/hour is shown alongside the mean because rare huge-payday sessions skew the average.</p>`;
+  panel.appendChild(div);
+
+  renderEdTable(div, [
+    { label: "Dominant Activity", key: "dominant_category" },
+    { label: "Sessions", key: "sessions" },
+    { label: "Avg Duration (h)", render: (r) => r.avg_duration_hours.toFixed(2) },
+    { label: "Avg Net Credits", render: (r) => Math.round(r.avg_net_credits).toLocaleString() },
+    { label: "Avg Credits/Hr", render: (r) => Math.round(r.avg_credits_per_hour).toLocaleString() },
+    { label: "Median Credits/Hr", render: (r) => Math.round(r.median_credits_per_hour).toLocaleString() },
+  ], data.efficiency);
+}
+
+function renderTopSessions(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Top Sessions</h2><p>Valid sessions only (0&ndash;12h). Net credits include any voucher/bulk-data redemption landing in the session even if earned earlier -- see the carryover caveat on Session Spotlights.</p>`;
+  panel.appendChild(div);
+
+  const cols = [
+    { label: "Date", render: (r) => r.session_start.slice(0, 10) },
+    { label: "Duration (h)", render: (r) => r.duration_hours.toFixed(2) },
+    { label: "Net Credits", render: (r) => Math.round(r.net_credits).toLocaleString() },
+    { label: "Dominant Activity", key: "dominant_category" },
+  ];
+
+  const h3a = document.createElement("h3");
+  h3a.textContent = "Most Lucrative";
+  h3a.style.cssText = "font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:20px;";
+  div.appendChild(h3a);
+  renderEdTable(div, cols, data.top_lucrative);
+
+  const h3b = document.createElement("h3");
+  h3b.textContent = "Longest";
+  h3b.style.cssText = h3a.style.cssText;
+  div.appendChild(h3b);
+  renderEdTable(div, cols, data.top_longest);
 }
 
 function tabIdFromHash() {
