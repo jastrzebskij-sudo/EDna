@@ -12,9 +12,9 @@ Maintained on request: *"Put together a to-do list for items that are worth foll
 | Ship & Fleet | 3 |
 | Narrative & Squadron | 2 |
 | Colonisation & BGS | 2 |
-| Exploration | 4 |
+| Exploration | 5 |
 | Unclassified | 1 |
-| **Total** | **22** |
+| **Total** | **23** |
 
 ---
 
@@ -64,6 +64,7 @@ Maintained on request: *"Put together a to-do list for items that are worth foll
 - **[ ]** A dedicated rare-star-type hunt (carbon-star/neutron-star cluster, or a second Blue-White or Red Super Giant to compare against the one on record) — `future-aspirations.md` item 3.
 - **[ ]** Decide whether the Thargoid barnacle-site thread (three systems surveyed in May 2025, zero combat) is worth expanding into actual Thargoid-war engagement, or should stand as a completed one-off finding.
 - **[ ]** Put the existing Guardian-tech investment (four distinct FSD booster sizes owned, unused) to actual use — a dedicated Guardian-sites run, or at minimum fit the best booster to Quo Vadis before the Rigel trip.
+- **[ ]** **`MultiSellExplorationData` sometimes carries a blank `""` `SystemName` on some (not all) entries of the same bulk sale — found while building EDna's Exploration Deep Dive tab, not yet fixed anywhere.** Confirmed on real rows (e.g. event id 146063: `Discovered` has 5 entries with `SystemName: ""` and one real `"Gliese 1081"`, all in the same event). Affects any per-system split of a bulk exploration-data payout — the "Most Profitable Systems by Exploration-Data Sale Value" table excludes these blank-named entries from its ranking rather than attributing credits to a fake "" system, which keeps ~45.4M credits (~3.4% of all bulk exploration-data sales fleet-wide) out of the per-system view entirely; shown explicitly on the page as a caveat rather than silently dropped. Root cause not investigated — possibly a specific journal-format era, or specific systems that hadn't yet been given a resolvable name server-side at scan time. Worth a proper look if a future feature needs a *complete* per-system reconciliation of bulk exploration-data credits (this tab's total-sale-value figure is shown alongside the ranked list precisely so the gap stays visible rather than papered over).
 
 ## Unclassified
 

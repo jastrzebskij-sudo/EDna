@@ -1052,4 +1052,534 @@ def economy():
     }
 
 
+# ---------------------------------------------------------------------------
+# Exploration Deep Dive (functional-requirements.md 2.6). The hard part of
+# this tab: "primary (arrival) star type per system" and "which system was
+# THIS event in" both require reconstructing system context from timestamps,
+# not from the events table's own `star_system` column -- confirmed sparse in
+# this dataset (populated on only ~7.4% of rows: 149,366 of 2,018,910) and,
+# per the spec, unreliable across format eras even where it does exist (the
+# precomputed lookup misses ~7-11% of pre-2018-format events).
+#
+# The reconstruction is a "gaps and islands" forward-fill, the same trick
+# /api/ships already uses for ship flight-hours spans: COUNT(x) OVER (ORDER
+# BY ...) only increments on non-null x, so it turns "has a marker appeared
+# yet" into a stable running group id; MAX() over that group id then carries
+# the marker's value forward to every row until the next one. The marker
+# here is a StarSystem field on the nearest preceding FSDJump/Location/
+# CarrierJump event *within the same session* (source_file) -- these three
+# event types always carry StarSystem in this DB (confirmed: 100% coverage
+# on all three, vs. 0% on ScanOrganic and ~91% on Scan).
+#
+# CRITICAL GOTCHA that cost real debugging time building this: computing the
+# forward-filled MAX() OVER(...) and filtering WHERE id IS NOT NULL in the
+# *same* SELECT is wrong -- a WHERE clause restricts which rows survive into
+# the FROM that the window function's own PARTITION sees. Filter to "only
+# the target rows" before MAX() OVER(PARTITION BY grp) runs, and each
+# partition contains only other target rows (system_mark always NULL for
+# those), so MAX() silently returns NULL for every single row -- a 100%
+# failure with no error. Fixed by computing the forward-fill over the FULL
+# combined (marker rows + target rows) set in one CTE, then filtering down
+# to target rows in a separate, later CTE selecting FROM that result.
+EXPLORATION_SYSTEM_MARKS_CTE = """
+    exploration_system_marks AS (
+        SELECT source_file, "timestamp", raw->>'StarSystem' AS system_mark
+        FROM events
+        WHERE event IN ('FSDJump', 'Location', 'CarrierJump') AND raw ? 'StarSystem'
+    )
+"""
+
+# Primary (arrival) star per system, bucketed into the fixed <=8-column
+# whitelist (functional-requirements.md 2.6/5.2 -- a 21-column one-per-star-
+# type table was built and rejected twice before). "Primary star" = the Scan
+# event with a StarType and DistanceFromArrivalLS ~ 0 (epsilon, not exact
+# equality -- floats) in that system.
+#
+# Star-type-to-column mapping decision (the actual judgment call the spec
+# asks to document): inspected every distinct raw StarType value in this DB
+# (`SELECT DISTINCT raw->>'StarType' FROM events WHERE event='Scan'`) and
+# found the 7 plain main-sequence letters (O, B, A, F, G, K, M) always occur
+# as bare, unsuffixed codes, while every giant/supergiant/remnant/pre-main-
+# sequence variant is a *different, longer* code that happens to start with
+# one of those letters: K_OrangeGiant, M_RedGiant, M_RedSuperGiant,
+# A_BlueWhiteSuperGiant, plus the white-dwarf family (DA/DC/DQ/DAZ), brown
+# dwarfs (L/T/Y), T Tauri stars (TTS), carbon stars (C), S-type stars (S),
+# neutron stars (N), and black holes (H). So the rule is an EXACT match
+# against the 7 bare letters -- not a "starts with" / first-letter match,
+# which would wrongly fold K_OrangeGiant into K's column and misrepresent a
+# giant as an ordinary K dwarf. Everything else pools into "Other".
+EXPLORATION_PRIMARY_STAR_CTE = f"""
+    {EXPLORATION_SYSTEM_MARKS_CTE},
+    primary_star_scans AS (
+        SELECT id, source_file, "timestamp", raw->>'StarType' AS star_type
+        FROM events
+        WHERE event = 'Scan' AND COALESCE(raw->>'StarType', '') != ''
+          AND (raw->>'DistanceFromArrivalLS')::double precision < 0.01
+    ),
+    primary_star_combined AS (
+        SELECT source_file, "timestamp", system_mark, NULL::bigint AS id
+        FROM exploration_system_marks
+        UNION ALL
+        SELECT source_file, "timestamp", NULL::text, id
+        FROM primary_star_scans
+    ),
+    primary_star_tagged AS (
+        SELECT *,
+               COUNT(system_mark) OVER (
+                   PARTITION BY source_file ORDER BY "timestamp", (system_mark IS NULL)
+               ) AS grp
+        FROM primary_star_combined
+    ),
+    primary_star_filled AS (
+        SELECT id, MAX(system_mark) OVER (PARTITION BY source_file, grp) AS star_system
+        FROM primary_star_tagged
+    ),
+    primary_star_resolved AS (
+        SELECT f.id, f.star_system, s.star_type
+        FROM primary_star_filled f
+        JOIN primary_star_scans s ON s.id = f.id
+        WHERE f.star_system IS NOT NULL
+    ),
+    system_primary_star AS (
+        -- One row per system. A physical star's type doesn't change between
+        -- visits, so any single deterministic reading is a reasonable,
+        -- stable pick when a system was scanned on more than one visit.
+        SELECT DISTINCT ON (star_system) star_system, star_type
+        FROM primary_star_resolved
+        ORDER BY star_system, star_type
+    ),
+    system_star_bucket AS (
+        SELECT star_system, star_type,
+               CASE WHEN star_type IN ('O', 'B', 'A', 'F', 'G', 'K', 'M') THEN star_type
+                    ELSE 'Other' END AS bucket
+        FROM system_primary_star
+    )
+"""
+
+# High-value planet classes (functional-requirements.md 2.6): confirmed
+# against real Scan rows' PlanetClass values, not assumed from memory.
+HV_PLANET_CLASSES = (
+    "Earthlike body", "Water world", "Ammonia world", "Water giant",
+    "Gas giant with water based life", "Gas giant with ammonia based life",
+)
+
+# Fixed display order for the star-type hit-rate table's columns
+# (functional-requirements.md 2.6/5.2: <=8 columns, never one per star type
+# actually seen).
+STAR_TYPE_BUCKET_ORDER = ["O", "B", "A", "F", "G", "K", "M", "Other"]
+
+# Rare stellar phenomena worth calling out by name in the notable-finds
+# narrative (functional-requirements.md 2.6) -- the spec names neutron
+# star/black hole/carbon star/S-type/orange giant/red giant/"the two white-
+# dwarf subtypes"; this DB's real StarType values (inspected directly) carry
+# four distinct white-dwarf codes (DA/DC/DQ/DAZ) and two additional
+# supergiant variants not explicitly named in the spec (red supergiant,
+# blue-white supergiant) -- included anyway since they're real, rare finds
+# in the data, not padding.
+RARE_STAR_TYPES = {
+    "N": "Neutron star",
+    "H": "Black hole",
+    "C": "Carbon star",
+    "S": "S-type star",
+    "K_OrangeGiant": "Orange giant",
+    "M_RedGiant": "Red giant",
+    "M_RedSuperGiant": "Red supergiant",
+    "A_BlueWhiteSuperGiant": "Blue-white supergiant",
+    "DA": "White dwarf (DA)",
+    "DC": "White dwarf (DC)",
+    "DQ": "White dwarf (DQ)",
+    "DAZ": "White dwarf (DAZ)",
+}
+
+
+@app.get("/api/exploration")
+def exploration():
+    # 1. Discovery-type x primary-star-type hit-rate table -- the hard part
+    # of this tab (functional-requirements.md 2.6). One combined pass:
+    # primary-star resolution (for the column buckets) plus all 4 discovery
+    # kinds, resolved to a system via the SAME timestamp-based mechanism in
+    # a single window-function pass over their union, rather than four
+    # separate (much more expensive) full CTE chains.
+    #
+    # "Pristine ring" = any Scan with ReserveLevel = PristineResources and a
+    # non-empty Rings array (ReserveLevel is a body-level field, confirmed
+    # against real rows -- not a per-ring field). "Pristine metallic ring" =
+    # the same, further restricted to a ring entry with RingClass =
+    # eRingClass_Metalic. "Biological find" = any CodexEntry with
+    # SubCategory_Localised = 'Organic structures' (confirmed the real
+    # subcategory label against the DB; a sibling 'Geology and anomalies'
+    # subcategory under the same Category_Localised is NOT life and is
+    # excluded).
+    star_type_rows = query(f"""
+        WITH {EXPLORATION_SYSTEM_MARKS_CTE},
+        primary_star_scans AS (
+            SELECT id, source_file, "timestamp", raw->>'StarType' AS star_type
+            FROM events
+            WHERE event = 'Scan' AND COALESCE(raw->>'StarType', '') != ''
+              AND (raw->>'DistanceFromArrivalLS')::double precision < 0.01
+        ),
+        exploration_target_events AS (
+            SELECT id, source_file, "timestamp", 'primary_star' AS kind FROM primary_star_scans
+            UNION ALL
+            SELECT id, source_file, "timestamp", 'hv_planet'
+            FROM events
+            WHERE event = 'Scan' AND raw->>'PlanetClass' IN %(hv_classes)s
+            UNION ALL
+            SELECT id, source_file, "timestamp", 'pristine_ring'
+            FROM events
+            WHERE event = 'Scan' AND raw->>'ReserveLevel' = 'PristineResources'
+              AND jsonb_array_length(COALESCE(raw->'Rings', '[]'::jsonb)) > 0
+            UNION ALL
+            SELECT e.id, e.source_file, e."timestamp", 'pristine_metallic_ring'
+            FROM events e
+            WHERE e.event = 'Scan' AND e.raw->>'ReserveLevel' = 'PristineResources'
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(e.raw->'Rings') r
+                  WHERE r->>'RingClass' = 'eRingClass_Metalic'
+              )
+            UNION ALL
+            SELECT id, source_file, "timestamp", 'bio_find'
+            FROM events
+            WHERE event = 'CodexEntry' AND raw->>'SubCategory_Localised' = 'Organic structures'
+        ),
+        combined AS (
+            SELECT source_file, "timestamp", system_mark, NULL::bigint AS id, NULL::text AS kind
+            FROM exploration_system_marks
+            UNION ALL
+            SELECT source_file, "timestamp", NULL::text, id, kind
+            FROM exploration_target_events
+        ),
+        tagged AS (
+            SELECT *,
+                   COUNT(system_mark) OVER (
+                       PARTITION BY source_file ORDER BY "timestamp", (system_mark IS NULL)
+                   ) AS grp
+            FROM combined
+        ),
+        filled AS (
+            SELECT id, kind, MAX(system_mark) OVER (PARTITION BY source_file, grp) AS star_system
+            FROM tagged
+        ),
+        resolved AS (
+            SELECT id, kind, star_system FROM filled WHERE id IS NOT NULL
+        ),
+        star_type_raw AS (
+            SELECT r.id, r.star_system, e.raw->>'StarType' AS star_type
+            FROM resolved r
+            JOIN events e ON e.id = r.id
+            WHERE r.kind = 'primary_star' AND r.star_system IS NOT NULL
+        ),
+        system_primary_star AS (
+            SELECT DISTINCT ON (star_system) star_system, star_type
+            FROM star_type_raw
+            ORDER BY star_system, star_type
+        ),
+        bucketed AS (
+            SELECT star_system,
+                   CASE WHEN star_type IN ('O', 'B', 'A', 'F', 'G', 'K', 'M') THEN star_type
+                        ELSE 'Other' END AS bucket
+            FROM system_primary_star
+        ),
+        totals AS (
+            SELECT bucket, COUNT(*) AS n_systems FROM bucketed GROUP BY bucket
+        ),
+        pivoted AS (
+            SELECT b.bucket,
+                COUNT(DISTINCT r.star_system) FILTER (WHERE r.kind = 'hv_planet') AS hv_planet_hits,
+                COUNT(DISTINCT r.star_system) FILTER (WHERE r.kind = 'pristine_ring') AS pristine_ring_hits,
+                COUNT(DISTINCT r.star_system)
+                    FILTER (WHERE r.kind = 'pristine_metallic_ring') AS pristine_metallic_ring_hits,
+                COUNT(DISTINCT r.star_system) FILTER (WHERE r.kind = 'bio_find') AS bio_find_hits
+            FROM resolved r
+            JOIN bucketed b ON b.star_system = r.star_system
+            WHERE r.kind != 'primary_star' AND r.star_system IS NOT NULL
+            GROUP BY b.bucket
+        )
+        SELECT t.bucket, t.n_systems,
+               COALESCE(p.hv_planet_hits, 0) AS hv_planet_hits,
+               COALESCE(p.pristine_ring_hits, 0) AS pristine_ring_hits,
+               COALESCE(p.pristine_metallic_ring_hits, 0) AS pristine_metallic_ring_hits,
+               COALESCE(p.bio_find_hits, 0) AS bio_find_hits
+        FROM totals t
+        LEFT JOIN pivoted p ON p.bucket = t.bucket
+    """, {"hv_classes": HV_PLANET_CLASSES})
+    star_type_by_bucket = {r["bucket"]: r for r in star_type_rows}
+    star_type_table = [
+        star_type_by_bucket.get(b, {
+            "bucket": b, "n_systems": 0, "hv_planet_hits": 0, "pristine_ring_hits": 0,
+            "pristine_metallic_ring_hits": 0, "bio_find_hits": 0,
+        })
+        for b in STAR_TYPE_BUCKET_ORDER
+    ]
+
+    # 2. Most profitable systems by exploration-data sale value (top 20).
+    # SellExplorationData's Systems array and MultiSellExplorationData's
+    # Discovered array each name several systems for one combined payout --
+    # split evenly across every listed system, stated as an approximation
+    # (functional-requirements.md 2.6: the journal doesn't itemize per-
+    # system value within a bulk sale).
+    #
+    # Real data-quality quirk found while building this (also logged in
+    # follow-up-todo.md): a small number of MultiSellExplorationData events
+    # carry a blank "" SystemName on some (not all) of their Discovered
+    # entries, alongside real names on the rest of the SAME event -- e.g.
+    # event id 146063's Discovered array has 5 blank-named entries and one
+    # named "Gliese 1081". The even-split-by-entry-count logic still applies
+    # (matches what the game actually paid out per system), but a blank name
+    # can't be attributed to any real system, so those entries are excluded
+    # from the ranked list -- ~3.4% of total bulk exploration-data credits
+    # end up unattributable this way, shown explicitly below rather than
+    # silently folded into some placeholder row.
+    system_sale_split = query(f"""
+        WITH {EXPLORATION_PRIMARY_STAR_CTE},
+        sale_split AS (
+            SELECT sysname AS system,
+                   (COALESCE((raw->>'BaseValue')::double precision, 0)
+                    + COALESCE((raw->>'Bonus')::double precision, 0))
+                   / NULLIF(jsonb_array_length(COALESCE(raw->'Systems', '[]'::jsonb)), 0) AS value
+            FROM events, jsonb_array_elements_text(raw->'Systems') sysname
+            WHERE event = 'SellExplorationData'
+            UNION ALL
+            SELECT elem->>'SystemName' AS system,
+                   COALESCE((raw->>'TotalEarnings')::double precision, 0)
+                   / NULLIF(jsonb_array_length(COALESCE(raw->'Discovered', '[]'::jsonb)), 0) AS value
+            FROM events, jsonb_array_elements(raw->'Discovered') elem
+            WHERE event = 'MultiSellExplorationData'
+        ),
+        system_totals AS (
+            SELECT system, SUM(value) AS total_value
+            FROM sale_split
+            GROUP BY system
+        )
+        SELECT st.system, st.total_value, b.star_type, (b.bucket = 'Other') AS exotic,
+               (st.system IS NULL OR st.system = '') AS unattributed
+        FROM system_totals st
+        LEFT JOIN system_star_bucket b ON b.star_system = st.system
+        ORDER BY st.total_value DESC
+    """)
+    unattributed_value = sum(
+        r["total_value"] or 0 for r in system_sale_split if r["unattributed"]
+    )
+    total_sale_value = sum(r["total_value"] or 0 for r in system_sale_split)
+    profitable_systems = [r for r in system_sale_split if not r["unattributed"]][:20]
+
+    # 3. Whether exotic-star-type systems earn a real exploration-credit
+    # premium: mean credits for systems with vs. without an exotic primary
+    # star, among the top 60 exploration-credit systems (functional-
+    # requirements.md 2.6) -- reported as an observed comparison, not
+    # asserted as fact either way. A meaningful chunk of even the top 60 have
+    # no known primary star at all (never had an arrival-star Scan logged),
+    # shown as its own "unknown" group rather than dropped silently.
+    top60 = [r for r in system_sale_split if not r["unattributed"]][:60]
+    exotic_group = [r["total_value"] for r in top60 if r["exotic"] is True]
+    known_nonexotic_group = [r["total_value"] for r in top60 if r["exotic"] is False]
+    unknown_group = [r["total_value"] for r in top60 if r["exotic"] is None]
+    exotic_premium = {
+        "exotic": {"n": len(exotic_group), "mean_credits": (sum(exotic_group) / len(exotic_group)) if exotic_group else None},
+        "known_non_exotic": {
+            "n": len(known_nonexotic_group),
+            "mean_credits": (sum(known_nonexotic_group) / len(known_nonexotic_group)) if known_nonexotic_group else None,
+        },
+        "unknown_star": {
+            "n": len(unknown_group),
+            "mean_credits": (sum(unknown_group) / len(unknown_group)) if unknown_group else None,
+        },
+    }
+
+    # 4. Most valuable systems for exobiology (top 20), from ScanOrganic
+    # scans joined to the player's own historical average sale value per
+    # species -- ScanOrganic and SellOrganicData are separate events with no
+    # direct reference to each other, so this is an estimate (functional-
+    # requirements.md 2.6), not an exact per-system sale figure. ScanOrganic
+    # fires 3x per species (Log/Sample/Analyse); restricted to ScanType =
+    # 'Log' (the first-logged record) so a species isn't triple-counted.
+    # ScanOrganic carries no StarSystem field at all (confirmed: 0 of 6,526
+    # rows) -- must use the same timestamp reconstruction as the hit-rate
+    # table, not an optional nicety here.
+    exobiology_systems = query(f"""
+        WITH {EXPLORATION_SYSTEM_MARKS_CTE},
+        scan_organic_log AS (
+            SELECT id, source_file, "timestamp", raw->>'Species_Localised' AS species
+            FROM events
+            WHERE event = 'ScanOrganic' AND raw->>'ScanType' = 'Log'
+        ),
+        combined AS (
+            SELECT source_file, "timestamp", system_mark, NULL::bigint AS id
+            FROM exploration_system_marks
+            UNION ALL
+            SELECT source_file, "timestamp", NULL::text, id
+            FROM scan_organic_log
+        ),
+        tagged AS (
+            SELECT *,
+                   COUNT(system_mark) OVER (
+                       PARTITION BY source_file ORDER BY "timestamp", (system_mark IS NULL)
+                   ) AS grp
+            FROM combined
+        ),
+        filled AS (
+            SELECT id, MAX(system_mark) OVER (PARTITION BY source_file, grp) AS star_system
+            FROM tagged
+        ),
+        resolved AS (
+            SELECT id, star_system FROM filled WHERE id IS NOT NULL
+        ),
+        species_value AS (
+            SELECT elem->>'Species_Localised' AS species,
+                   AVG(COALESCE((elem->>'Value')::double precision, 0)
+                       + COALESCE((elem->>'Bonus')::double precision, 0)) AS avg_value,
+                   COUNT(*) AS samples
+            FROM events, jsonb_array_elements(raw->'BioData') elem
+            WHERE event = 'SellOrganicData'
+            GROUP BY 1
+        )
+        SELECT r.star_system, COUNT(*) AS species_logged,
+               SUM(COALESCE(sv.avg_value, 0)) AS estimated_value
+        FROM resolved r
+        JOIN scan_organic_log s ON s.id = r.id
+        LEFT JOIN species_value sv ON sv.species = s.species
+        WHERE r.star_system IS NOT NULL AND r.star_system != ''
+        GROUP BY r.star_system
+        ORDER BY estimated_value DESC
+        LIMIT 20
+    """)
+
+    # 5. Highest-value biological species analysed (top 15 by the player's
+    # own average sale credits per sample) -- reuses the same species_value
+    # logic as #4 above, standalone here since this view doesn't need any
+    # system attribution at all.
+    top_species = query("""
+        SELECT elem->>'Species_Localised' AS species,
+               AVG(COALESCE((elem->>'Value')::double precision, 0)
+                   + COALESCE((elem->>'Bonus')::double precision, 0)) AS avg_value,
+               COUNT(*) AS samples
+        FROM events, jsonb_array_elements(raw->'BioData') elem
+        WHERE event = 'SellOrganicData'
+        GROUP BY 1
+        ORDER BY avg_value DESC
+        LIMIT 15
+    """)
+
+    # 6. First-time Codex discoveries by subcategory.
+    codex_first_time = query("""
+        SELECT raw->>'SubCategory_Localised' AS subcategory, COUNT(*) AS n
+        FROM events
+        WHERE event = 'CodexEntry' AND (raw->>'IsNewEntry')::boolean
+        GROUP BY 1
+        ORDER BY n DESC
+    """)
+
+    # 7. Notable/unusual finds narrative -- Thargoid Codex encounters,
+    # chronological. CodexEntry rows carry System directly (confirmed: 1,816
+    # of 1,816 CodexEntry rows have it) -- no reconstruction needed for this
+    # one, unlike the hit-rate table above.
+    thargoid_encounters = query("""
+        SELECT "timestamp", raw->>'Name_Localised' AS name, raw->>'System' AS system
+        FROM events
+        WHERE event = 'CodexEntry' AND raw->>'SubCategory_Localised' = 'Thargoid objects'
+        ORDER BY "timestamp"
+    """)
+
+    # 7b. Rare stellar phenomena visited: count + first-seen date (and
+    # system, when the Scan event itself carries StarSystem -- true on ~91%
+    # of Scan rows; not reconstructed for this narrative aside, unlike the
+    # hit-rate table's primary-star column, since a missing system name here
+    # is just a blank in a list, not a wrong denominator in a percentage).
+    rare_star_rows = query("""
+        SELECT raw->>'StarType' AS star_type, COUNT(*) AS n,
+               MIN("timestamp") AS first_seen,
+               (array_agg(raw->>'StarSystem' ORDER BY "timestamp"))[1] AS first_seen_system
+        FROM events
+        WHERE event = 'Scan' AND raw->>'StarType' = ANY(%s)
+        GROUP BY 1
+    """, (list(RARE_STAR_TYPES.keys()),))
+    rare_star_by_type = {r["star_type"]: r for r in rare_star_rows}
+    rare_stellar_phenomena = [
+        {
+            "star_type": st, "label": label,
+            "n": rare_star_by_type[st]["n"] if st in rare_star_by_type else 0,
+            "first_seen": rare_star_by_type[st]["first_seen"] if st in rare_star_by_type else None,
+            "first_seen_system": rare_star_by_type[st]["first_seen_system"] if st in rare_star_by_type else None,
+        }
+        for st, label in RARE_STAR_TYPES.items()
+    ]
+    rare_stellar_phenomena = [r for r in rare_stellar_phenomena if r["n"] > 0]
+
+    # 7c. Carryover callout: the single session with the highest combined
+    # bulk exploration-data sale total, checked against how many of ITS OWN
+    # named systems were actually visited (FSDJump/Location/CarrierJump)
+    # within that same session -- the general mechanism functional-
+    # requirements.md 2.7 calls the "carryover check" (Session Spotlights
+    # isn't built yet in this app, so this is a narrow, one-session version
+    # of the same idea, scoped to exploration data specifically).
+    top_session = query("""
+        SELECT source_file,
+               SUM(CASE
+                   WHEN event = 'SellExplorationData' THEN
+                       COALESCE((raw->>'BaseValue')::double precision, 0)
+                       + COALESCE((raw->>'Bonus')::double precision, 0)
+                   WHEN event = 'MultiSellExplorationData' THEN
+                       COALESCE((raw->>'TotalEarnings')::double precision, 0)
+                   ELSE 0
+               END) AS total_bulk_credits
+        FROM events
+        WHERE event IN ('SellExplorationData', 'MultiSellExplorationData')
+        GROUP BY source_file
+        ORDER BY total_bulk_credits DESC
+        LIMIT 1
+    """)
+    carryover_outlier = None
+    if top_session:
+        source_file = top_session[0]["source_file"]
+        session_meta = query(
+            "SELECT session_start, duration_hours FROM sessions WHERE source_file = %s",
+            (source_file,),
+        )
+        carryover_rows = query("""
+            WITH named_systems AS (
+                SELECT sysname AS system
+                FROM events, jsonb_array_elements_text(raw->'Systems') sysname
+                WHERE event = 'SellExplorationData' AND source_file = %(sf)s
+                UNION ALL
+                SELECT elem->>'SystemName' AS system
+                FROM events, jsonb_array_elements(raw->'Discovered') elem
+                WHERE event = 'MultiSellExplorationData' AND source_file = %(sf)s
+            ),
+            visited AS (
+                SELECT DISTINCT raw->>'StarSystem' AS system
+                FROM events
+                WHERE event IN ('FSDJump', 'Location', 'CarrierJump')
+                  AND source_file = %(sf)s AND raw ? 'StarSystem'
+            )
+            SELECT n.system, (n.system IN (SELECT system FROM visited)) AS visited_this_session
+            FROM named_systems n
+            WHERE n.system IS NOT NULL AND n.system != ''
+        """, {"sf": source_file})
+        named = [r["system"] for r in carryover_rows]
+        not_visited = [r["system"] for r in carryover_rows if not r["visited_this_session"]]
+        carryover_outlier = {
+            "source_file": source_file,
+            "session_start": session_meta[0]["session_start"] if session_meta else None,
+            "total_bulk_credits": top_session[0]["total_bulk_credits"],
+            "named_systems_count": len(named),
+            "not_visited_count": len(not_visited),
+            "pct_carried_over": (len(not_visited) / len(named) * 100) if named else 0,
+            "examples": sorted(not_visited)[:8],
+        }
+
+    return {
+        "star_type_table": star_type_table,
+        "profitable_systems": profitable_systems,
+        "unattributed_sale_value": unattributed_value,
+        "total_sale_value": total_sale_value,
+        "exotic_premium": exotic_premium,
+        "exobiology_systems": exobiology_systems,
+        "top_species": top_species,
+        "codex_first_time": codex_first_time,
+        "thargoid_encounters": thargoid_encounters,
+        "rare_stellar_phenomena": rare_stellar_phenomena,
+        "carryover_outlier": carryover_outlier,
+    }
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

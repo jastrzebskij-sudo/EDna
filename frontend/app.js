@@ -56,6 +56,8 @@ function renderTab(id) {
     renderCombat(panel);
   } else if (id === "economy") {
     renderEconomy(panel);
+  } else if (id === "exploration") {
+    renderExploration(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -1404,6 +1406,308 @@ function renderEconomyReconciliation(panel, data) {
     Sum of all per-ship totals: <strong>${shipSum.toLocaleString()}</strong> &nbsp;&middot;&nbsp;
     <span style="color:${match ? "var(--ed-green-safe)" : "var(--ed-red-hostile)"}">${match ? "Reconciles" : "MISMATCH"}</span></p>`;
   panel.appendChild(div);
+}
+
+// Fixed display order for the star-type hit-rate table's columns -- must
+// match the backend's STAR_TYPE_BUCKET_ORDER (app/main.py). The backend
+// already returns rows in this order; this is just documentation of the
+// contract, not re-sorting.
+function renderExploration(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading exploration data&hellip;</p></div>`;
+  fetch("/api/exploration")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "panel";
+      note.innerHTML = `<h2>Exploration Deep Dive</h2>
+        <p>System attribution throughout this tab (except where a raw event already carries its own system name
+        directly, like Codex entries) is reconstructed from timestamps &mdash; the nearest preceding
+        <code>FSDJump</code>/<code>Location</code>/<code>CarrierJump</code> event in the same session &mdash;
+        rather than the database's own precomputed <code>star_system</code> column, which is populated on only
+        about 7% of rows and is known to miss 7&ndash;11% of pre-2018-format events even where it exists.</p>`;
+      panel.appendChild(note);
+      renderExplorationProfitableSystems(panel, data);
+      renderExplorationExoticPremium(panel, data);
+      renderExplorationExobiologySystems(panel, data);
+      renderExplorationTopSpecies(panel, data);
+      renderExplorationCodexFirstTime(panel, data);
+      renderExplorationStarTypeTable(panel, data);
+      renderExplorationNarrative(panel, data);
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/exploration -- ${e}</p></div>`;
+    });
+}
+
+function renderExplorationProfitableSystems(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  const unattributedPct = data.total_sale_value
+    ? ((data.unattributed_sale_value / data.total_sale_value) * 100).toFixed(1)
+    : "0";
+  div.innerHTML = `<h2>Most Profitable Systems by Exploration-Data Sale Value</h2>
+    <p>Top 20. A bulk sale (<code>SellExplorationData</code>/<code>MultiSellExplorationData</code>) lists several
+    systems together with one combined payout &mdash; split evenly across the listed systems, an approximation
+    since the journal doesn't itemize per-system value within a bulk sale. Systems with a known
+    <span style="color:var(--ed-orange)">exotic primary star</span> are flagged distinctly.</p>
+    <p class="ed-note">${data.unattributed_sale_value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+    credits (${unattributedPct}% of all bulk exploration-data sales) came from bulk-sale entries with a blank
+    system name in the raw journal data itself (a real data quirk: some <code>MultiSellExplorationData</code>
+    events mix blank-named and real-named entries in the same <code>Discovered</code> array) &mdash; excluded from
+    this ranking since it can't be attributed to any system.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.profitable_systems.length * 22));
+
+  const rows = data.profitable_systems;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.system),
+      datasets: [{
+        label: "Estimated sale value",
+        data: rows.map((r) => r.total_value),
+        backgroundColor: rows.map((r) => (r.exotic ? "rgba(255, 128, 0, 0.85)" : "rgba(63, 169, 255, 0.6)")),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const r = rows[ctx.dataIndex];
+              if (r.exotic) return `Exotic primary star (${r.star_type})`;
+              if (r.star_type) return `Primary star: ${r.star_type}`;
+              return "Primary star: unknown (never scanned at arrival)";
+            },
+          },
+        },
+      },
+      scales: { x: logAxis("Estimated sale value (credits, log scale)") },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderExplorationExoticPremium(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  const p = data.exotic_premium;
+  const fmt = (g) => (g.mean_credits === null ? "n/a" : Math.round(g.mean_credits).toLocaleString());
+  div.innerHTML = `<h2>Do Exotic-Star Systems Earn a Real Exploration-Credit Premium?</h2>
+    <p>Mean estimated sale value per system, among the top 60 exploration-credit systems (see above), split by
+    whether the system's primary star is a known exotic type ("Other" column) or a known main-sequence type.
+    Reported as an observed comparison &mdash; the exotic sample here is small, so this is not asserted as fact
+    either way.</p>
+    <div class="stat-row" style="margin-top:12px;">
+      <div><div class="stat" style="font-size:1.3em;">${fmt(p.exotic)}</div>
+        <div class="stat-label">Exotic primary star (n=${p.exotic.n})</div></div>
+      <div><div class="stat" style="font-size:1.3em;">${fmt(p.known_non_exotic)}</div>
+        <div class="stat-label">Known main-sequence primary (n=${p.known_non_exotic.n})</div></div>
+      <div><div class="stat" style="font-size:1.3em;">${fmt(p.unknown_star)}</div>
+        <div class="stat-label">Unknown primary star (n=${p.unknown_star.n})</div></div>
+    </div>`;
+  panel.appendChild(div);
+}
+
+function renderExplorationExobiologySystems(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Most Valuable Systems for Exobiology</h2>
+    <p>Top 20, estimated from <code>ScanOrganic</code> scans (first-logged sample per species only) joined to this
+    player's own historical average sale value per species. <code>ScanOrganic</code> and
+    <code>SellOrganicData</code> are separate events with no direct reference to each other, so this is an
+    estimate, not an exact per-system sale figure.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.exobiology_systems.length * 22));
+
+  const rows = data.exobiology_systems;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.star_system),
+      datasets: [{
+        label: "Estimated exobiology value",
+        data: rows.map((r) => r.estimated_value),
+        backgroundColor: "rgba(122, 92, 255, 0.6)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => `${rows[ctx.dataIndex].species_logged} species logged`,
+          },
+        },
+      },
+      scales: { x: logAxis("Estimated value (credits, log scale)") },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderExplorationTopSpecies(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Highest-Value Biological Species Analyzed</h2>
+    <p>Top 15 by this player's own average sale credits per sample (<code>SellOrganicData</code>'s
+    <code>BioData</code> entries).</p>`;
+  panel.appendChild(div);
+
+  renderEdTable(div, [
+    { label: "Species", key: "species" },
+    { label: "Avg Credits/Sample", render: (r) => Math.round(r.avg_value).toLocaleString() },
+    { label: "Samples Sold", key: "samples" },
+  ], data.top_species);
+}
+
+function renderExplorationCodexFirstTime(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>First-Time Codex Discoveries by Subcategory</h2>
+    <p>Count of <code>IsNewEntry</code> Codex entries, grouped by <code>SubCategory_Localised</code>.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(200, data.codex_first_time.length * 30));
+
+  const rows = data.codex_first_time;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.subcategory),
+      datasets: [{
+        label: "First-time discoveries",
+        data: rows.map((r) => r.n),
+        backgroundColor: "rgba(53, 212, 122, 0.6)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { title: { display: true, text: "First-time discoveries" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+// The star-type hit-rate table -- see functional-requirements.md 2.6/5.2.
+// Columns are the fixed <=8-bucket whitelist the backend already computed
+// and ordered (O/B/A/F/G/K/M/Other); this function only pivots discovery
+// type (rows) x bucket (columns), it does not decide the buckets themselves.
+// Every cell shows the raw hit-count/visited-count evidence alongside the
+// percentage (functional-requirements.md 0: no heuristic without its raw
+// evidence visible next to it), and every column header shows its own n=
+// since a small n makes that column's percentage noisy.
+function renderExplorationStarTypeTable(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Discovery-Type &times; Primary-Star-Type Hit Rate</h2>
+    <p>For each primary (arrival) star type actually visited, the % of systems that produced at least one find of
+    each type. The 7 main-sequence classes (O, B, A, F, G, K, M) each get their own column; every other star type
+    actually visited (giants, brown dwarfs, white dwarfs, neutron stars, black holes, etc.) pools into a single
+    "Other" column, computed at the system level (union of every exotic type's own systems) &mdash; never as an
+    average of the member types' individual rates, so a rarely-visited exotic type can't get equal weight to a
+    heavily-visited one. Read this for the broad A/F/G/K-vs-M-vs-everything-else shape; small columns (low n) are
+    noisy.</p>`;
+  panel.appendChild(div);
+
+  const cell = (bucketRow, field) => {
+    const hits = bucketRow[field];
+    const n = bucketRow.n_systems;
+    const pct = n ? ((hits / n) * 100).toFixed(1) + "%" : "n/a";
+    return `${pct} <span class="ed-note" style="margin:0;">(${hits}/${n})</span>`;
+  };
+
+  const columns = [{ label: "Discovery Type", key: "label" }].concat(
+    data.star_type_table.map((b) => ({
+      label: `${b.bucket} (n=${b.n_systems.toLocaleString()})`,
+      render: (row) => cell(b, row.field),
+    }))
+  );
+
+  const rows = [
+    { label: "High-value planet", field: "hv_planet_hits" },
+    { label: "Pristine ring (any)", field: "pristine_ring_hits" },
+    { label: "Pristine metallic ring", field: "pristine_metallic_ring_hits" },
+    { label: "Biological find", field: "bio_find_hits" },
+  ];
+
+  renderEdTable(div, columns, rows);
+}
+
+function renderExplorationNarrative(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Notable &amp; Unusual Finds</h2>`;
+  panel.appendChild(div);
+
+  const h3a = document.createElement("h3");
+  h3a.textContent = `Thargoid Codex Encounters (${data.thargoid_encounters.length})`;
+  h3a.style.cssText = "font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:0;";
+  div.appendChild(h3a);
+  if (data.thargoid_encounters.length) {
+    renderEdTable(div, [
+      { label: "Date", render: (r) => r.timestamp.slice(0, 10) },
+      { label: "Name", key: "name" },
+      { label: "System", key: "system" },
+    ], data.thargoid_encounters);
+  } else {
+    const p = document.createElement("p");
+    p.className = "ed-note";
+    p.textContent = "No Thargoid Codex encounters recorded.";
+    div.appendChild(p);
+  }
+
+  const h3b = document.createElement("h3");
+  h3b.textContent = "Rare Stellar Phenomena Visited";
+  h3b.style.cssText = h3a.style.cssText;
+  h3b.style.marginTop = "20px";
+  div.appendChild(h3b);
+  renderEdTable(div, [
+    { label: "Type", key: "label" },
+    { label: "Raw StarType", key: "star_type" },
+    { label: "Times Visited", key: "n" },
+    { label: "First Seen", render: (r) => r.first_seen.slice(0, 10) },
+    { label: "First-Seen System", render: (r) => r.first_seen_system || "unrecorded" },
+  ], data.rare_stellar_phenomena);
+
+  const h3c = document.createElement("h3");
+  h3c.textContent = "Carryover Callout: Was This Really One Incredible Session?";
+  h3c.style.cssText = h3a.style.cssText;
+  h3c.style.marginTop = "20px";
+  div.appendChild(h3c);
+  const c = data.carryover_outlier;
+  if (!c) {
+    const p = document.createElement("p");
+    p.className = "ed-note";
+    p.textContent = "No bulk exploration-data sales recorded.";
+    div.appendChild(p);
+  } else {
+    const p = document.createElement("p");
+    p.innerHTML = `The single highest bulk exploration-data payday in this dataset landed in the session starting
+      <strong>${(c.session_start || "").slice(0, 10)}</strong> (<code>${c.source_file}</code>):
+      <strong>${Math.round(c.total_bulk_credits).toLocaleString()}</strong> credits across
+      <strong>${c.named_systems_count}</strong> named systems. Of those,
+      <strong>${c.not_visited_count}</strong> (${c.pct_carried_over.toFixed(1)}%) were <em>not</em> visited during
+      this session &mdash; this was not one incredible session, it was a multi-session accumulation cashed out all
+      at once.`;
+    div.appendChild(p);
+    if (c.examples.length) {
+      const note = document.createElement("p");
+      note.className = "ed-note";
+      note.textContent = "Named-but-not-visited-this-session examples: " + c.examples.join(", ");
+      div.appendChild(note);
+    }
+  }
 }
 
 function tabIdFromHash() {
