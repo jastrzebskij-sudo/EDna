@@ -468,12 +468,18 @@ def ship_mix(ship: str):
 # which isn't always present) must not null out that event's contribution,
 # which would otherwise poison the whole session's SUM() to NULL.
 #
+# session_credit_events also carries the raw `event` column through (not just
+# the computed credit_delta) -- Session Spotlights needs to bucket each
+# event's own delta into one of its 4 "what earned the credits" categories
+# (functional-requirements.md 2.8) without re-deriving credit_delta itself.
+#
 # This is a fragment of CTE bodies (no leading "WITH", no trailing comma) --
 # splice it into a query's WITH clause, e.g.:
 #   f"WITH {SESSION_NET_CREDITS_CTE} SELECT * FROM session_net_credits"
 SESSION_NET_CREDITS_CTE = """
     session_credit_events AS (
         SELECT source_file,
+               event,
                CASE event
                    WHEN 'Bounty' THEN
                        COALESCE((raw->>'TotalReward')::double precision, 0)
@@ -1865,6 +1871,271 @@ def surface():
         },
         "default_to_ship_gap_evidence": default_gap_evidence,
     }
+
+
+# ---------------------------------------------------------------------------
+# Session Spotlights (functional-requirements.md 2.8). Per-session deep dive
+# on the SAME top-5-most-lucrative-sessions list as Play Patterns (2.3) --
+# same 0-12h valid-session window, same net-credits ranking, reusing
+# PLAY_PATTERNS_VALID_SESSIONS_CTE (and therefore SESSION_NET_CREDITS_CTE /
+# SESSION_DOMINANT_CATEGORY_CTE) rather than re-deriving any of it.
+#
+# Every query below filters to these 5 source_files as early as possible
+# (source_file = ANY(%(sfs)s)) -- unlike the full-table window-function
+# queries elsewhere in this app (Surface Activity's ~20s pass over ~2M rows),
+# this tab only ever touches a handful of sessions' worth of events, so
+# nothing here should be anywhere near that slow.
+
+# "What earned the credits" bucket for each credit-relevant event
+# (functional-requirements.md 2.8) -- exactly 4 buckets. Applied on top of
+# SESSION_NET_CREDITS_CTE's own per-event credit_delta (extended above to
+# carry the raw `event` column through) so the per-bucket sums are built
+# from the exact same numbers as the shared net-credits total, not a
+# separate re-derivation of the voucher math.
+SPOTLIGHT_BUCKET_CASE = """CASE
+                   WHEN event = 'MissionCompleted' THEN 'Mission reward'
+                   WHEN event IN ('Bounty', 'FactionKillBond') THEN 'Combat voucher'
+                   WHEN event IN ('MarketSell', 'MarketBuy', 'RedeemVoucher') THEN 'Trading/other voucher'
+                   WHEN event IN ('SellExplorationData', 'MultiSellExplorationData', 'SellOrganicData')
+                       THEN 'Bulk exploration/exobiology data'
+               END"""
+
+SPOTLIGHT_BUCKETS = [
+    "Mission reward", "Combat voucher", "Trading/other voucher",
+    "Bulk exploration/exobiology data",
+]
+
+
+@app.get("/api/spotlights")
+def spotlights():
+    top5 = query(f"""
+        WITH {PLAY_PATTERNS_VALID_SESSIONS_CTE}
+        SELECT source_file, session_start, duration_hours, net_credits,
+               credits_per_hour, dominant_category
+        FROM valid_sessions
+        ORDER BY net_credits DESC
+        LIMIT 5
+    """)
+    source_files = [r["source_file"] for r in top5]
+    if not source_files:
+        return {"sessions": []}
+    sfs = {"sfs": source_files}
+
+    # Header block: ships flown + event counts. REAL_SHIP_FILTER'd (functional-
+    # requirements.md 1.3) -- "every ship flown" means real, pilotable ships,
+    # not the SRV/suit Loadout artifacts that share this same ship column.
+    ships = query(f"""
+        SELECT source_file, ship, COUNT(*) AS n
+        FROM events
+        WHERE ship IS NOT NULL AND source_file = ANY(%(sfs)s) AND {REAL_SHIP_FILTER}
+        GROUP BY source_file, ship
+        ORDER BY source_file, n DESC
+    """, sfs)
+
+    # Header block: systems visited, in visit order (FSDJump/Location/
+    # CarrierJump all carry StarSystem at 100% coverage in this DB -- see the
+    # Exploration Deep Dive tab's EXPLORATION_SYSTEM_MARKS_CTE comment -- no
+    # forward-fill reconstruction needed, these events ARE the markers).
+    system_visits = query("""
+        SELECT source_file, "timestamp", event, raw->>'StarSystem' AS system
+        FROM events
+        WHERE event IN ('FSDJump', 'Location', 'CarrierJump')
+          AND raw ? 'StarSystem' AND source_file = ANY(%(sfs)s)
+        ORDER BY source_file, "timestamp"
+    """, sfs)
+
+    # Predominant events this session by category (Ambient excluded, same
+    # default as every other activity-mix view in this report).
+    category_counts = query("""
+        SELECT source_file, category, COUNT(*) AS n
+        FROM events
+        WHERE category IS NOT NULL AND category != 'Ambient' AND source_file = ANY(%(sfs)s)
+        GROUP BY source_file, category
+        ORDER BY source_file, n DESC
+    """, sfs)
+
+    # What earned the credits, bucketed (see SPOTLIGHT_BUCKET_CASE above).
+    credit_buckets = query(f"""
+        WITH {SESSION_NET_CREDITS_CTE}
+        SELECT source_file, {SPOTLIGHT_BUCKET_CASE} AS bucket, SUM(credit_delta) AS amount
+        FROM session_credit_events
+        WHERE source_file = ANY(%(sfs)s)
+        GROUP BY source_file, bucket
+    """, sfs)
+
+    # Carryover check, part 1: exploration-data sales name their own systems
+    # (SellExplorationData's Systems[] / MultiSellExplorationData's
+    # Discovered[].SystemName -- confirmed against real rows in this DB
+    # before writing this query). Some Discovered entries carry a blank ""
+    # SystemName alongside real ones on the same event (functional-
+    # requirements.md 2.8 / follow-up-todo.md) -- filtered out in Python
+    # below, not counted as "not visited".
+    named_systems = query("""
+        SELECT source_file, sysname AS system
+        FROM events, jsonb_array_elements_text(raw->'Systems') sysname
+        WHERE event = 'SellExplorationData' AND source_file = ANY(%(sfs)s)
+        UNION ALL
+        SELECT source_file, elem->>'SystemName' AS system
+        FROM events, jsonb_array_elements(raw->'Discovered') elem
+        WHERE event = 'MultiSellExplorationData' AND source_file = ANY(%(sfs)s)
+    """, sfs)
+
+    # Carryover check, part 2: exobiology. SellOrganicData proceeds in a
+    # session with zero of that session's OWN ScanOrganic events are flagged
+    # carried-over.
+    organic_proceeds = query("""
+        SELECT source_file,
+               SUM(COALESCE((elem->>'Value')::double precision, 0)
+                   + COALESCE((elem->>'Bonus')::double precision, 0)) AS proceeds
+        FROM events, jsonb_array_elements(raw->'BioData') elem
+        WHERE event = 'SellOrganicData' AND source_file = ANY(%(sfs)s)
+        GROUP BY source_file
+    """, sfs)
+    scan_organic_counts = query("""
+        SELECT source_file, COUNT(*) AS n
+        FROM events
+        WHERE event = 'ScanOrganic' AND source_file = ANY(%(sfs)s)
+        GROUP BY source_file
+    """, sfs)
+
+    # Combat opponent breakdown -- same Target/Target_Localised field and
+    # vehicle_state==SHIP scoping as Combat Analysis's fleet-wide
+    # bounty_opponents query above, just grouped per-session too.
+    bounty_opponents = query("""
+        SELECT source_file,
+               raw->>'Target' AS target,
+               MAX(raw->>'Target_Localised') FILTER (
+                   WHERE COALESCE(raw->>'Target_Localised', '') != ''
+                     AND raw->>'Target_Localised' NOT LIKE '$%%'
+               ) AS target_localised,
+               COUNT(*) AS kills,
+               SUM(COALESCE((raw->>'TotalReward')::double precision, 0)) AS total_reward
+        FROM events
+        WHERE event = 'Bounty' AND vehicle_state = 'SHIP' AND source_file = ANY(%(sfs)s)
+        GROUP BY source_file, target
+        ORDER BY source_file, kills DESC
+    """, sfs)
+
+    # Exploration detail: scan-type counts, distinct exobiology species
+    # (ScanOrganic's ScanType='Log' is the first-logged record per species,
+    # same restriction Exploration Deep Dive uses to avoid triple-counting),
+    # new Codex entries.
+    scan_types = query("""
+        SELECT source_file, COALESCE(NULLIF(raw->>'ScanType', ''), 'Unknown') AS scan_type, COUNT(*) AS n
+        FROM events
+        WHERE event = 'Scan' AND source_file = ANY(%(sfs)s)
+        GROUP BY source_file, scan_type
+        ORDER BY source_file, n DESC
+    """, sfs)
+    exobiology_species = query("""
+        SELECT DISTINCT source_file, raw->>'Species_Localised' AS species
+        FROM events
+        WHERE event = 'ScanOrganic' AND raw->>'ScanType' = 'Log' AND source_file = ANY(%(sfs)s)
+    """, sfs)
+    codex_new = query("""
+        SELECT source_file, "timestamp", raw->>'Name_Localised' AS name,
+               raw->>'SubCategory_Localised' AS subcategory
+        FROM events
+        WHERE event = 'CodexEntry' AND (raw->>'IsNewEntry')::boolean AND source_file = ANY(%(sfs)s)
+        ORDER BY source_file, "timestamp"
+    """, sfs)
+
+    # --- Assemble per-session dicts in Python from the flat, source_file-
+    # tagged rows above (the "flat rows in, matrix/grouping in JS or Python"
+    # pattern used throughout this app). ---
+
+    def by_sf(rows):
+        d = {}
+        for r in rows:
+            d.setdefault(r["source_file"], []).append(r)
+        return d
+
+    ships_by_sf = by_sf(ships)
+    visits_by_sf = by_sf(system_visits)
+    categories_by_sf = by_sf(category_counts)
+    buckets_by_sf = by_sf(credit_buckets)
+    named_by_sf = by_sf(named_systems)
+    organic_by_sf = {r["source_file"]: r["proceeds"] or 0 for r in organic_proceeds}
+    scan_organic_n_by_sf = {r["source_file"]: r["n"] for r in scan_organic_counts}
+    bounty_by_sf = by_sf(bounty_opponents)
+    scan_types_by_sf = by_sf(scan_types)
+    species_by_sf = by_sf(exobiology_species)
+    codex_by_sf = by_sf(codex_new)
+
+    sessions = []
+    for s in top5:
+        sf = s["source_file"]
+
+        # Systems visited, in visit order, deduplicated on first sighting.
+        seen = []
+        seen_set = set()
+        jump_count = 0
+        for row in visits_by_sf.get(sf, []):
+            if row["event"] == "FSDJump":
+                jump_count += 1
+            sysname = row["system"]
+            if sysname and sysname not in seen_set:
+                seen_set.add(sysname)
+                seen.append(sysname)
+
+        # What earned the credits: all 4 buckets always present, 0 if unused.
+        bucket_amounts = {b: 0.0 for b in SPOTLIGHT_BUCKETS}
+        for row in buckets_by_sf.get(sf, []):
+            if row["bucket"] in bucket_amounts:
+                bucket_amounts[row["bucket"]] = row["amount"] or 0
+
+        # Carryover check for the bulk-data bucket only.
+        named_rows = [r for r in named_by_sf.get(sf, []) if r["system"]]
+        not_visited = sorted({r["system"] for r in named_rows if r["system"] not in seen_set})
+        exploration_flagged = len(not_visited) > 0
+        organic_proceeds_this = organic_by_sf.get(sf, 0)
+        own_scan_organic = scan_organic_n_by_sf.get(sf, 0)
+        exobiology_flagged = organic_proceeds_this > 0 and own_scan_organic == 0
+        has_bulk_data = bool(named_rows) or organic_proceeds_this > 0
+        carryover = {
+            "has_bulk_data": has_bulk_data,
+            "exploration_named_count": len(named_rows),
+            "exploration_not_visited_count": len(not_visited),
+            "exploration_not_visited_examples": not_visited[:8],
+            "exploration_flagged": exploration_flagged,
+            "exobiology_proceeds": organic_proceeds_this,
+            "exobiology_own_scan_count": own_scan_organic,
+            "exobiology_flagged": exobiology_flagged,
+            "any_flagged": exploration_flagged or exobiology_flagged,
+        }
+
+        combat_opponents = bounty_by_sf.get(sf, [])
+
+        exploration_detail = {
+            "scan_types": scan_types_by_sf.get(sf, []),
+            "species": sorted({r["species"] for r in species_by_sf.get(sf, []) if r["species"]}),
+            "codex_new": codex_by_sf.get(sf, []),
+        }
+        has_exploration_detail = bool(
+            exploration_detail["scan_types"] or exploration_detail["species"] or exploration_detail["codex_new"]
+        )
+
+        sessions.append({
+            "source_file": sf,
+            "session_start": s["session_start"],
+            "duration_hours": s["duration_hours"],
+            "net_credits": s["net_credits"],
+            "credits_per_hour": s["credits_per_hour"],
+            "dominant_category": s["dominant_category"],
+            "ships": ships_by_sf.get(sf, []),
+            "systems_visited": seen,
+            "systems_visited_total": len(seen),
+            "jump_count": jump_count,
+            "category_counts": categories_by_sf.get(sf, []),
+            "credit_buckets": bucket_amounts,
+            "carryover": carryover,
+            "combat_opponents": combat_opponents,
+            "has_combat": bool(combat_opponents),
+            "exploration_detail": exploration_detail,
+            "has_exploration_detail": has_exploration_detail,
+        })
+
+    return {"sessions": sessions}
 
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

@@ -6,7 +6,7 @@ Maintained on request: *"Put together a to-do list for items that are worth foll
 
 | Activity type | Open items |
 |---|---|
-| Tool & Engineering (report tool / data pipeline) | 6 |
+| Tool & Engineering (report tool / data pipeline) | 7 |
 | Live Gameplay Tooling (future capabilities) | 1 |
 | Combat | 3 |
 | Ship & Fleet | 3 |
@@ -14,7 +14,7 @@ Maintained on request: *"Put together a to-do list for items that are worth foll
 | Colonisation & BGS | 2 |
 | Exploration | 5 |
 | Unclassified | 1 |
-| **Total** | **23** |
+| **Total** | **24** |
 
 ---
 
@@ -30,6 +30,7 @@ Maintained on request: *"Put together a to-do list for items that are worth foll
 - **[ ]** Wire the After-Action Analysis feature to periodically re-check *external* BGS state (EDSM) for the colony-rebellion campaign below, not just internal journal data — flagged as a gap in the design as drafted.
 - **[ ]** Disambiguate the `Scout` substring count (mundane NPC ship-role term vs. actual Thargoid Scout) if Thargoid engagement level becomes a real feature question rather than idle curiosity — open item carried over from `journal-analysis-findings.md`.
 - **[ ]** Build the standalone `etl.py`/`schema.sql`/`requirements.txt` packaging described in `data-architecture.md` §5 — still a one-off in-session script, not the shareable tool.
+- **[ ]** **`SESSION_NET_CREDITS_CTE` likely double-counts bounty/combat-bond earnings — found while building EDna's Session Spotlights tab, not yet fixed.** The shared net-credits formula (`app/main.py`, used by both Play Patterns 2.3 and Session Spotlights 2.8) sums `Bounty`'s own `TotalReward` *and* `RedeemVoucher`'s `Amount` as separate credit deltas. But a `Bounty` event only grants a redeemable voucher, not an instant credit-balance change — the credits only actually land when that voucher is cashed in at a redemption kiosk, logged as `RedeemVoucher` with `Type: "bounty"` (same mechanic for combat bonds via `FactionKillBond` + `RedeemVoucher Type: "CombatBond"`). Counting both looks like real double-counting whenever the same play session both earns and redeems, which is the common case. Confirmed on Session Spotlights' own #1 session (`Journal.2025-07-16T125133.01.log`): 82 `Bounty` events sum to exactly 28,416,102 credits, and that session's single `RedeemVoucher` (`Type: "bounty"`) is *also* exactly 28,416,102 — the same money counted twice, roughly doubling that session's reported net credits. Confirmed at fleet-wide scale too: `Bounty` totals 7,094,667,774 across 27,386 events vs. `RedeemVoucher Type: "bounty"` totaling 7,442,674,399 across 1,151 events (close enough to be the same underlying cash flow, not two independent income sources); `FactionKillBond` totals 89,297,957 vs. `RedeemVoucher Type: "CombatBond"` totaling 177,409,141 (roughly 2x, consistent with the same doubling). Not fixed here because both already-shipped tabs (Play Patterns' top-lucrative/credit-efficiency figures and now every Session Spotlights session) depend on this exact shared formula staying byte-for-byte consistent between them — changing it unilaterally while building Spotlights would silently change Play Patterns' already-verified numbers too. The real fix likely needs `Bounty`/`FactionKillBond` dropped from the credit_delta CASE entirely (since the money isn't realized until redemption) or, more conservatively, some reconciliation between "vouchers earned" and "vouchers redeemed" so the same credits aren't attributed to both events — either way it touches both tabs at once and needs its own round.
 
 ## Live Gameplay Tooling (future capabilities)
 

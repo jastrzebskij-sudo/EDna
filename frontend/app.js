@@ -60,6 +60,8 @@ function renderTab(id) {
     renderExploration(panel);
   } else if (id === "surface") {
     renderSurface(panel);
+  } else if (id === "spotlights") {
+    renderSpotlights(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -1968,6 +1970,229 @@ function renderSurfaceNarrative(panel, data) {
     predominantly <strong>${cat(n.srv_free_top_category)}</strong>.</p>
     <p class="ed-note">Recomputed live from the data above on every page load &mdash; not hardcoded.</p>`;
   panel.appendChild(div);
+}
+
+// ---------------------------------------------------------------------------
+// Session Spotlights (functional-requirements.md 2.8). A per-session deep
+// dive on the same top-5-most-lucrative-sessions list /api/play-patterns
+// already ranks (same 0-12h valid-session window, same net-credits formula).
+let spotlightsCharts = [];
+
+const SPOTLIGHT_BUCKET_ORDER = [
+  "Mission reward", "Combat voucher", "Trading/other voucher", "Bulk exploration/exobiology data",
+];
+const SPOTLIGHT_BUCKET_COLORS = {
+  "Mission reward": CATEGORY_COLORS["Passengers/Missions"],
+  "Combat voucher": CATEGORY_COLORS["Combat"],
+  "Trading/other voucher": CATEGORY_COLORS["Trading"],
+  "Bulk exploration/exobiology data": CATEGORY_COLORS["Exploration (deep)"],
+};
+
+function spotlightSubheading(text) {
+  const h3 = document.createElement("h3");
+  h3.textContent = text;
+  h3.style.cssText = "font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;" +
+    "text-transform:uppercase;letter-spacing:0.05em;margin-top:22px;";
+  return h3;
+}
+
+function renderSpotlights(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading session spotlights&hellip;</p></div>`;
+  fetch("/api/spotlights")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      const intro = document.createElement("div");
+      intro.className = "panel";
+      intro.innerHTML = `<h2>Session Spotlights</h2>
+        <p>A per-session deep dive on the same top-5-most-lucrative-sessions list as Play Patterns (0&ndash;12h
+        valid sessions, same net-credits ranking and formula). A session's net credits can include a
+        voucher/bulk-data redemption that was actually earned across many earlier sessions and just cashed in
+        here &mdash; see each session's carryover check on its bulk exploration/exobiology-data bucket below.</p>`;
+      panel.appendChild(intro);
+
+      if (!data.sessions.length) {
+        const empty = document.createElement("div");
+        empty.className = "panel";
+        empty.innerHTML = `<p>No valid sessions found.</p>`;
+        panel.appendChild(empty);
+        return;
+      }
+
+      data.sessions.forEach((session, i) => renderSpotlightSession(panel, session, i));
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/spotlights -- ${e}</p></div>`;
+    });
+}
+
+function renderSpotlightSession(panel, s, index) {
+  const div = document.createElement("div");
+  div.className = "panel";
+
+  const dateStr = (s.session_start || "").slice(0, 10);
+  const shipsList = s.ships.length
+    ? s.ships.map((r) => `${r.ship} (${r.n.toLocaleString()} events)`).join(", ")
+    : "none recorded (real-ship filter excludes SRV/suit loadouts)";
+  const previewSystems = s.systems_visited.slice(0, 10);
+  const moreCount = s.systems_visited_total - previewSystems.length;
+
+  div.innerHTML = `
+    <h2>#${index + 1} &mdash; ${dateStr}</h2>
+    <div class="stat-row" style="flex-wrap:wrap; gap:32px; margin-bottom:16px;">
+      <div><div class="stat">${Math.round(s.net_credits).toLocaleString()}</div><div class="stat-label">Net Credits</div></div>
+      <div><div class="stat">${s.duration_hours.toFixed(2)}h</div><div class="stat-label">Duration</div></div>
+      <div><div class="stat">${Math.round(s.credits_per_hour).toLocaleString()}</div><div class="stat-label">Credits / Hour</div></div>
+      <div><div class="stat" style="font-size:1.05em;">${s.dominant_category}</div><div class="stat-label">Dominant Activity</div></div>
+    </div>
+    <p><strong>Ships flown:</strong> ${shipsList}</p>
+    <p><strong>Systems visited (${s.systems_visited_total}, ${s.jump_count.toLocaleString()} FSD jumps):</strong>
+      ${previewSystems.join(" &rarr; ") || "none recorded"}${moreCount > 0 ? ` <span class="ed-note">(+${moreCount} more)</span>` : ""}</p>
+    <p class="ed-note">Source: <code>${s.source_file}</code></p>
+  `;
+  panel.appendChild(div);
+
+  renderSpotlightEventsChart(div, s);
+  renderSpotlightCreditBuckets(div, s);
+  if (s.has_combat) renderSpotlightCombat(div, s);
+  if (s.has_exploration_detail) renderSpotlightExploration(div, s);
+}
+
+function renderSpotlightEventsChart(container, s) {
+  container.appendChild(spotlightSubheading("Predominant Events This Session"));
+  const rows = [...s.category_counts].sort((a, b) => b.n - a.n);
+  const canvas = chartCanvas(container, Math.max(160, rows.length * 28));
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.category),
+      datasets: [{
+        label: "Events",
+        data: rows.map((r) => r.n),
+        backgroundColor: rows.map((r) => CATEGORY_COLORS[r.category] || "#888"),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { title: { display: true, text: "Events" } } },
+    },
+  });
+  spotlightsCharts.push(chart);
+}
+
+function renderSpotlightCreditBuckets(container, s) {
+  container.appendChild(spotlightSubheading("What Earned The Credits"));
+  const note = document.createElement("p");
+  note.innerHTML = `Bucketed into exactly 4 categories: "Mission reward" (<code>MissionCompleted</code> only),
+    "Combat voucher" (<code>Bounty</code>/<code>FactionKillBond</code>), "Trading/other voucher" (net
+    <code>MarketSell</code>&minus;<code>MarketBuy</code> + <code>RedeemVoucher</code>), and "Bulk
+    exploration/exobiology data" (<code>SellExplorationData</code>/<code>MultiSellExplorationData</code>/
+    <code>SellOrganicData</code>).`;
+  container.appendChild(note);
+
+  const canvas = chartCanvas(container, 200);
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: SPOTLIGHT_BUCKET_ORDER,
+      datasets: [{
+        label: "Credits",
+        data: SPOTLIGHT_BUCKET_ORDER.map((b) => s.credit_buckets[b] || 0),
+        backgroundColor: SPOTLIGHT_BUCKET_ORDER.map((b) => SPOTLIGHT_BUCKET_COLORS[b] || "#888"),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => `${Math.round(ctx.parsed.x).toLocaleString()} credits` } },
+      },
+      scales: { x: { title: { display: true, text: "Credits" } } },
+    },
+  });
+  spotlightsCharts.push(chart);
+
+  renderSpotlightCarryover(container, s);
+}
+
+function renderSpotlightCarryover(container, s) {
+  const c = s.carryover;
+  const p = document.createElement("p");
+  p.className = "ed-note";
+
+  if (!c.has_bulk_data) {
+    p.innerHTML = `<strong>Carryover check:</strong> no bulk exploration/exobiology data was sold this session
+      &mdash; not applicable.`;
+    container.appendChild(p);
+    return;
+  }
+
+  const parts = [];
+  if (c.exploration_named_count > 0) {
+    if (c.exploration_flagged) {
+      const shown = c.exploration_not_visited_examples.join(", ");
+      const more = c.exploration_not_visited_count > c.exploration_not_visited_examples.length ? ", &hellip;" : "";
+      parts.push(`<strong>${c.exploration_not_visited_count} of ${c.exploration_named_count}</strong> systems
+        named in this session's exploration-data sale(s) were NOT visited this session &mdash; carried over from
+        earlier exploring: ${shown}${more}.`);
+    } else {
+      parts.push(`All <strong>${c.exploration_named_count}</strong> systems named in this session's
+        exploration-data sale(s) were visited this session.`);
+    }
+  }
+  if (c.exobiology_proceeds > 0) {
+    if (c.exobiology_flagged) {
+      parts.push(`<strong>${Math.round(c.exobiology_proceeds).toLocaleString()}</strong> credits of
+        exobiology-sale proceeds landed this session with zero of this session's own
+        <code>ScanOrganic</code> events &mdash; carried over from earlier scanning.`);
+    } else {
+      parts.push(`Exobiology-sale proceeds (${Math.round(c.exobiology_proceeds).toLocaleString()} credits) line
+        up with this session's own ${c.exobiology_own_scan_count.toLocaleString()} <code>ScanOrganic</code>
+        event(s).`);
+    }
+  }
+  p.innerHTML = `<strong>Carryover check:</strong> ${parts.join(" ")}`;
+  container.appendChild(p);
+}
+
+function renderSpotlightCombat(container, s) {
+  container.appendChild(spotlightSubheading("Combat Opponent Breakdown"));
+  const note = document.createElement("p");
+  note.innerHTML = `From <code>Bounty</code> vouchers only, vehicle_state == SHIP &mdash; same field/scoping as
+    Combat Analysis's fleet-wide opponent breakdown.`;
+  container.appendChild(note);
+  renderEdTable(container, [
+    { label: "Opponent", render: (r) => r.target_localised || r.target },
+    { label: "Kills", key: "kills" },
+    { label: "Total Reward", render: (r) => Math.round(r.total_reward).toLocaleString() },
+  ], s.combat_opponents);
+}
+
+function renderSpotlightExploration(container, s) {
+  container.appendChild(spotlightSubheading("Exploration Detail"));
+  const d = s.exploration_detail;
+  if (d.scan_types.length) {
+    renderEdTable(container, [
+      { label: "Scan Type", key: "scan_type" },
+      { label: "Count", key: "n" },
+    ], d.scan_types);
+  }
+  if (d.species.length) {
+    const p = document.createElement("p");
+    p.innerHTML = `<strong>Distinct exobiology species scanned (${d.species.length}):</strong> ${d.species.join(", ")}`;
+    container.appendChild(p);
+  }
+  if (d.codex_new.length) {
+    const p = document.createElement("p");
+    p.innerHTML = `<strong>New (<code>IsNewEntry</code>) Codex entries logged this session:</strong> ` +
+      d.codex_new.map((r) => `${r.name || "unnamed"} (${r.subcategory || "n/a"})`).join(", ");
+    container.appendChild(p);
+  }
 }
 
 function tabIdFromHash() {
