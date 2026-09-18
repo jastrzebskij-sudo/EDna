@@ -1,0 +1,18 @@
+services:
+  edna:
+    build: .
+    container_name: edna
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.edna.rule=Host(`edna.localhost`)"
+      - "traefik.http.routers.edna.entrypoints=web"
+      - "traefik.http.services.edna.loadbalancer.server.port=8000"
+
+networks:
+  web:
+    external: true
