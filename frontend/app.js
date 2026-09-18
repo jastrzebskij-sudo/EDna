@@ -54,6 +54,8 @@ function renderTab(id) {
     renderPlayPatterns(panel);
   } else if (id === "combat") {
     renderCombat(panel);
+  } else if (id === "economy") {
+    renderEconomy(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -1158,6 +1160,250 @@ function renderOverconfidenceNarrative(panel, data) {
     ul.appendChild(li);
   });
   div.appendChild(ul);
+}
+
+function renderEconomy(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading economy data&hellip;</p></div>`;
+  fetch("/api/economy")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "panel";
+      note.innerHTML = `<h2>Economy Analysis</h2>
+        <p><code>MarketSell</code> doesn't record whether sold cargo was bought (real trading) or mined (free).
+        Any commodity this player has ever mined at all is therefore excluded from "pure trading" profit entirely
+        &mdash; otherwise mining income silently inflates trading-profit figures (confirmed to overstate by
+        ~80x in one real case: painite, 10 units ever bought vs. 16,321 sold). This deliberately
+        <em>understates</em> trading profit for commodities that are legitimately both bought/sold and mined
+        (gold, silver, palladium, platinum, tritium) &mdash; the journal has no per-unit provenance to split them,
+        so counting it all as mining is the conservative, defensible choice, not a bug.</p>
+        <p class="ed-note">A second exclusion applies everywhere below: a commodity with zero recorded
+        <code>MarketBuy</code> events ever (mission-reward/salvage/colonization cargo sold for a spurious
+        "profit") is also excluded from "pure trade." Both exclusions are evaluated per-commodity, fleet-wide,
+        identically for the fleet total and every per-ship total below &mdash; see the reconciliation check.</p>`;
+      panel.appendChild(note);
+      renderEconomyCreditsPerHour(panel, data);
+      renderTradeCommodities(panel, data);
+      renderMinedCommodities(panel, data);
+      renderEconomyShipEarnings(panel, data);
+      renderEconomyExclusionEvidence(panel, data);
+      renderEconomyReconciliation(panel, data);
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/economy -- ${e}</p></div>`;
+    });
+}
+
+function renderEconomyCreditsPerHour(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Credits per Active Hour: Trading vs. Mining</h2>
+    <p>"Active hour" = distinct hour-buckets containing at least one event of that category (same concept as
+    the Play Patterns tempo chart). Trading credits = pure-trade profit (see below); mining credits = estimated
+    value of mined commodities (units refined &times; the player's own average sell price).</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, 220);
+
+  const rows = data.credits_per_active_hour;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.category),
+      datasets: [{
+        label: "Credits / active hour",
+        data: rows.map((r) => (r.active_hours ? r.credits / r.active_hours : 0)),
+        backgroundColor: rows.map((r) => CATEGORY_COLORS[r.category] || "#888"),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const r = rows[ctx.dataIndex];
+              return `${r.active_hours.toLocaleString()} active hours, ${Math.round(r.credits).toLocaleString()} total credits`;
+            },
+          },
+        },
+      },
+      scales: { x: { title: { display: true, text: "Credits / active hour" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderTradeCommodities(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Most Profitable Pure-Trade Commodities</h2>
+    <p>Top 15 by estimated total profit (total sale &minus; total cost). Excludes any commodity ever mined by
+    this player and any commodity with zero recorded buys &mdash; see the exclusion evidence below.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.trade_commodities.length * 24));
+
+  const rows = data.trade_commodities;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.display),
+      datasets: [{
+        label: "Profit",
+        data: rows.map((r) => r.profit),
+        backgroundColor: "rgba(255, 128, 0, 0.6)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const r = rows[ctx.dataIndex];
+              return `raw Type: ${r.commodity}\nSale: ${Math.round(r.total_sale).toLocaleString()} — Cost: ${Math.round(r.total_cost).toLocaleString()}`;
+            },
+          },
+        },
+      },
+      scales: { x: { title: { display: true, text: "Estimated profit (credits)" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderMinedCommodities(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Most Valuable Mined Commodities</h2>
+    <p>Top 15 by estimated total value (units refined &times; this player's own historical average
+    <code>MarketSell</code> price per unit for that commodity).</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.mining_commodities.length * 24));
+
+  const rows = data.mining_commodities;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.display),
+      datasets: [{
+        label: "Estimated value",
+        data: rows.map((r) => r.estimated_value),
+        backgroundColor: "rgba(201, 138, 58, 0.7)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterLabel: (ctx) => {
+              const r = rows[ctx.dataIndex];
+              return `raw Type: ${r.commodity}\n${r.units_refined.toLocaleString()} units @ ${Math.round(r.avg_sell_price).toLocaleString()}/unit avg`;
+            },
+          },
+        },
+      },
+      scales: { x: logAxis("Estimated value (log scale)") },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderEconomyShipEarnings(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Best-Earning Ship per Activity</h2>
+    <p>Top 10 trading ships by estimated pure-trade profit, top 10 mining ships by estimated mining value.
+    Per-ship trade profit is attributed to whichever ship did the buying or selling &mdash; cargo bought on one
+    ship and sold from another (a fleet-carrier transfer) legitimately shows as a loss on the buyer and a gain
+    on the seller. That's a correct description of which ship handled which side of the transaction, not a bug.</p>`;
+  panel.appendChild(div);
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex; gap:32px; flex-wrap:wrap;";
+  div.appendChild(wrap);
+
+  const tradeCol = document.createElement("div");
+  tradeCol.style.flex = "1 1 320px";
+  tradeCol.innerHTML = `<h3 style="font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:0;">Top Trading Ships</h3>`;
+  wrap.appendChild(tradeCol);
+  renderEdTable(tradeCol, [
+    { label: "Ship", key: "ship" },
+    { label: "Pure-Trade Profit", render: (r) => Math.round(r.total_profit).toLocaleString() },
+  ], data.trade_by_ship);
+
+  const miningCol = document.createElement("div");
+  miningCol.style.flex = "1 1 320px";
+  miningCol.innerHTML = `<h3 style="font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:0;">Top Mining Ships</h3>`;
+  wrap.appendChild(miningCol);
+  renderEdTable(miningCol, [
+    { label: "Ship", key: "ship" },
+    { label: "Estimated Mining Value", render: (r) => Math.round(r.total_value).toLocaleString() },
+  ], data.mining_by_ship);
+}
+
+function renderEconomyExclusionEvidence(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Exclusion Evidence</h2>
+    <p>Raw evidence for what the critical correctness rule above excludes and why -- nothing here asserts a
+    conclusion without the underlying sale/mining totals visible next to it.</p>`;
+  panel.appendChild(div);
+
+  const h3a = document.createElement("h3");
+  h3a.textContent = "Excluded: also mined by this player (MarketSell revenue kept out of trading profit)";
+  h3a.style.cssText = "font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:20px;";
+  div.appendChild(h3a);
+  renderEdTable(div, [
+    { label: "Commodity", key: "display" },
+    { label: "Raw Type", key: "commodity" },
+    { label: "MarketSell Revenue", render: (r) => Math.round(r.total_sale).toLocaleString() },
+    { label: "Units Sold", render: (r) => Math.round(r.units).toLocaleString() },
+  ], data.excluded_mined_but_sold);
+
+  const h3b = document.createElement("h3");
+  h3b.textContent = "Excluded: zero recorded MarketBuy events ever (mission-reward/salvage/colonization cargo)";
+  h3b.style.cssText = h3a.style.cssText;
+  div.appendChild(h3b);
+  if (!data.excluded_zero_buy.length) {
+    const p = document.createElement("p");
+    p.className = "ed-note";
+    p.textContent = "None found -- every sold, non-mined commodity in this dataset has at least one recorded buy.";
+    div.appendChild(p);
+  } else {
+    renderEdTable(div, [
+      { label: "Commodity", key: "display" },
+      { label: "Raw Type", key: "commodity" },
+      { label: "MarketSell Revenue", render: (r) => Math.round(r.total_sale).toLocaleString() },
+      { label: "Units Sold", render: (r) => Math.round(r.units).toLocaleString() },
+    ], data.excluded_zero_buy);
+  }
+}
+
+function renderEconomyReconciliation(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  const r = data.reconciliation;
+  const fleet = Math.round(r.fleet_total_pure_trade_profit);
+  const shipSum = Math.round(r.ship_sum_pure_trade_profit);
+  const match = Math.abs(fleet - shipSum) < 1;
+  div.innerHTML = `<h2>Reconciliation Check</h2>
+    <p>The fleet-wide pure-trade-profit total and the sum of every ship's per-ship pure-trade profit must be the
+    same number -- this exact check caught a real bug in the original tool.</p>
+    <p class="ed-note">Fleet-wide total: <strong>${fleet.toLocaleString()}</strong> &nbsp;&middot;&nbsp;
+    Sum of all per-ship totals: <strong>${shipSum.toLocaleString()}</strong> &nbsp;&middot;&nbsp;
+    <span style="color:${match ? "var(--ed-green-safe)" : "var(--ed-red-hostile)"}">${match ? "Reconciles" : "MISMATCH"}</span></p>`;
+  panel.appendChild(div);
 }
 
 function tabIdFromHash() {

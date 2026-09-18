@@ -733,4 +733,323 @@ def combat():
     }
 
 
+# ---------------------------------------------------------------------------
+# Economy Analysis (functional-requirements.md 2.5). This is the whole point
+# of the tab, so read this carefully before touching anything below:
+#
+# MarketSell does not record whether the sold cargo was bought (real trading)
+# or mined (free). Confirmed by inspecting real rows in this DB: a commodity
+# like painite has 1 MarketBuy event (10 units) ever, against 87 MarketSell
+# events (16,321 units) -- so naively summing MarketSell - MarketBuy per
+# commodity would count ~16,311 units of free mined cargo as "trading
+# profit," a ~80x overstatement for painite alone (confirmed real bug in the
+# original tool). So: any commodity this player has EVER mined at all (a
+# MiningRefined event for it, anywhere in the whole history) is excluded from
+# "pure trading" profit entirely. This deliberately UNDERSTATES trading
+# profit for the handful of commodities that are legitimately both
+# bought/sold and mined (gold, silver, palladium, platinum, tritium) -- the
+# journal has no per-unit provenance to split "this unit was bought, that one
+# was mined," so "count it all as mining" is the conservative, defensible
+# choice, not a guess.
+#
+# A second, narrower exclusion applies identically everywhere below: a
+# commodity with literally zero MarketBuy events anywhere in the dataset
+# (e.g. mission-reward/salvage/colonization cargo picked up free and sold)
+# is also excluded from "pure trade" -- otherwise it would show as pure
+# profit with no corresponding fleet-wide cost, and the fleet-wide total
+# would never reconcile against the sum of per-ship totals.
+#
+# Both exclusions are evaluated at the COMMODITY level, fleet-wide -- never
+# per-ship. That's what makes the reconciliation hold: for every included
+# commodity, fleet-wide profit is exactly the sum of that commodity's
+# per-ship (sale - cost) splits by construction (summing the same numbers
+# grouped a different way), so summing per-ship totals across every ship and
+# every included commodity always equals the fleet-wide total. Verified live
+# in economy() below (functional-requirements.md 5.5) -- this exact check
+# caught a real bug in the original tool and must never regress.
+#
+# MiningRefined's own Type field is wrapped in Elite's internal localization
+# token format (e.g. "$painite_name;"); MarketBuy/MarketSell's Type field is
+# already a bare lowercase slug (e.g. "painite") -- confirmed by inspecting
+# real rows, not assumed from memory. The join/exclusion normalizes
+# MiningRefined's Type by stripping the "$" prefix and "_name;" suffix, then
+# compares against MarketBuy/Sell's Type directly. Type_Localised is NOT used
+# as a join key -- it's unreliable even within MiningRefined alone (e.g. the
+# same Type shows up as both "Low Temp. Diamonds" and "Low Temperature
+# Diamonds" on different rows) -- it's only used for a display label,
+# picking one arbitrary-but-consistent non-empty value per commodity.
+#
+# Bare CTE-body fragment (no leading WITH, no trailing comma), same splicing
+# convention as SESSION_NET_CREDITS_CTE above.
+PURE_TRADE_CTE = """
+    mined_commodities AS (
+        SELECT DISTINCT regexp_replace(lower(raw->>'Type'), '^[$]|_name;$', '', 'g') AS commodity
+        FROM events WHERE event = 'MiningRefined'
+    ),
+    market_sell AS (
+        SELECT lower(raw->>'Type') AS commodity, ship,
+               COALESCE((raw->>'TotalSale')::double precision, 0) AS total_sale,
+               COALESCE((raw->>'Count')::double precision, 0) AS units
+        FROM events WHERE event = 'MarketSell'
+    ),
+    market_buy AS (
+        SELECT lower(raw->>'Type') AS commodity, ship,
+               COALESCE((raw->>'TotalCost')::double precision, 0) AS total_cost,
+               COALESCE((raw->>'Count')::double precision, 0) AS units
+        FROM events WHERE event = 'MarketBuy'
+    ),
+    bought_commodities AS (
+        SELECT DISTINCT commodity FROM market_buy
+    ),
+    pure_trade_commodities AS (
+        SELECT commodity FROM bought_commodities
+        WHERE commodity NOT IN (SELECT commodity FROM mined_commodities)
+    ),
+    commodity_names AS (
+        SELECT lower(raw->>'Type') AS commodity, raw->>'Type_Localised' AS localised
+        FROM events
+        WHERE event IN ('MarketSell', 'MarketBuy')
+          AND COALESCE(raw->>'Type_Localised', '') != ''
+        UNION ALL
+        SELECT regexp_replace(lower(raw->>'Type'), '^[$]|_name;$', '', 'g') AS commodity,
+               raw->>'Type_Localised' AS localised
+        FROM events
+        WHERE event = 'MiningRefined' AND COALESCE(raw->>'Type_Localised', '') != ''
+    ),
+    commodity_display AS (
+        SELECT commodity, MIN(localised) AS display
+        FROM commodity_names
+        GROUP BY commodity
+    ),
+    mining_sell_price AS (
+        -- Player's own historical average sell price per unit, per
+        -- commodity, from their actual MarketSell sales (functional-
+        -- requirements.md 2.5: "that commodity's own historical average
+        -- sell price," not a hardcoded game-wide price). Computed over ALL
+        -- MarketSell rows for the commodity, not just pure-trade
+        -- commodities -- a mined commodity like painite still needs its own
+        -- real sell price to value the mined units.
+        SELECT commodity, SUM(total_sale) / NULLIF(SUM(units), 0) AS avg_sell_price
+        FROM market_sell
+        GROUP BY commodity
+    )
+"""
+
+
+@app.get("/api/economy")
+def economy():
+    # 1. Credits per active hour: trading vs mining. Same "active hour"
+    # concept as Play Patterns' tempo chart (functional-requirements.md
+    # 2.3/2.5): distinct hour-buckets containing >=1 event of that category.
+    active_hours = query("""
+        SELECT category, COUNT(DISTINCT date_trunc('hour', "timestamp")) AS active_hours
+        FROM events
+        WHERE category IN ('Trading', 'Mining')
+        GROUP BY category
+    """)
+
+    # 2. Most profitable pure-trade commodities, top 15, plus the raw
+    # sale/cost totals as evidence.
+    trade_commodities = query(f"""
+        WITH {PURE_TRADE_CTE},
+        sale_by_commodity AS (
+            SELECT commodity, SUM(total_sale) AS total_sale FROM market_sell GROUP BY commodity
+        ),
+        cost_by_commodity AS (
+            SELECT commodity, SUM(total_cost) AS total_cost FROM market_buy GROUP BY commodity
+        ),
+        trade_commodity_profit AS (
+            SELECT p.commodity,
+                   COALESCE(sc.total_sale, 0) AS total_sale,
+                   COALESCE(cc.total_cost, 0) AS total_cost,
+                   COALESCE(sc.total_sale, 0) - COALESCE(cc.total_cost, 0) AS profit
+            FROM pure_trade_commodities p
+            LEFT JOIN sale_by_commodity sc ON sc.commodity = p.commodity
+            LEFT JOIN cost_by_commodity cc ON cc.commodity = p.commodity
+        )
+        SELECT t.commodity, COALESCE(d.display, initcap(t.commodity)) AS display,
+               t.total_sale, t.total_cost, t.profit
+        FROM trade_commodity_profit t
+        LEFT JOIN commodity_display d ON d.commodity = t.commodity
+        ORDER BY t.profit DESC
+        LIMIT 15
+    """)
+
+    # Fleet-wide pure-trade profit total across ALL included commodities
+    # (not just the top 15) -- the number that must reconcile with the sum
+    # of every ship's per-ship pure-trade profit below.
+    fleet_trade_profit_total = query(f"""
+        WITH {PURE_TRADE_CTE},
+        sale_by_commodity AS (
+            SELECT commodity, SUM(total_sale) AS total_sale FROM market_sell GROUP BY commodity
+        ),
+        cost_by_commodity AS (
+            SELECT commodity, SUM(total_cost) AS total_cost FROM market_buy GROUP BY commodity
+        )
+        SELECT COALESCE(SUM(COALESCE(sc.total_sale, 0) - COALESCE(cc.total_cost, 0)), 0) AS total
+        FROM pure_trade_commodities p
+        LEFT JOIN sale_by_commodity sc ON sc.commodity = p.commodity
+        LEFT JOIN cost_by_commodity cc ON cc.commodity = p.commodity
+    """)[0]["total"]
+
+    # 3. Most valuable mined commodities, top 15: units refined x the
+    # commodity's own average sell price (see mining_sell_price above).
+    mining_commodities = query(f"""
+        WITH {PURE_TRADE_CTE},
+        mined_commodity_totals AS (
+            SELECT regexp_replace(lower(raw->>'Type'), '^[$]|_name;$', '', 'g') AS commodity,
+                   COUNT(*) AS units_refined
+            FROM events WHERE event = 'MiningRefined'
+            GROUP BY commodity
+        )
+        SELECT m.commodity, COALESCE(d.display, initcap(m.commodity)) AS display,
+               m.units_refined,
+               COALESCE(p.avg_sell_price, 0) AS avg_sell_price,
+               m.units_refined * COALESCE(p.avg_sell_price, 0) AS estimated_value
+        FROM mined_commodity_totals m
+        LEFT JOIN mining_sell_price p ON p.commodity = m.commodity
+        LEFT JOIN commodity_display d ON d.commodity = m.commodity
+        ORDER BY estimated_value DESC
+        LIMIT 15
+    """)
+
+    fleet_mining_value_total = query(f"""
+        WITH {PURE_TRADE_CTE},
+        mined_commodity_totals AS (
+            SELECT regexp_replace(lower(raw->>'Type'), '^[$]|_name;$', '', 'g') AS commodity,
+                   COUNT(*) AS units_refined
+            FROM events WHERE event = 'MiningRefined'
+            GROUP BY commodity
+        )
+        SELECT COALESCE(SUM(m.units_refined * COALESCE(p.avg_sell_price, 0)), 0) AS total
+        FROM mined_commodity_totals m
+        LEFT JOIN mining_sell_price p ON p.commodity = m.commodity
+    """)[0]["total"]
+
+    # 4/6/7. Best-earning ship per activity. Trade profit is restricted to
+    # the exact same pure-trade commodity set as the fleet-wide figure (see
+    # PURE_TRADE_CTE) -- computed as sale-by-(ship,commodity) minus
+    # cost-by-(ship,commodity), FULL OUTER JOINed so a ship that only sold
+    # (or only bought) a commodity still gets a row. Cargo bought on one
+    # ship and sold from another (a fleet-carrier transfer) legitimately
+    # shows as a loss on the buyer and a gain on the seller -- this is a
+    # correct description of which ship handled which side of the
+    # transaction, not a bug (functional-requirements.md 2.5). Fetches ALL
+    # ships (not just top 10) so the full sum can be reconciled against
+    # fleet_trade_profit_total below.
+    trade_by_ship_all = query(f"""
+        WITH {PURE_TRADE_CTE},
+        ship_sale AS (
+            SELECT ship, commodity, SUM(total_sale) AS total_sale
+            FROM market_sell
+            WHERE ship IS NOT NULL AND commodity IN (SELECT commodity FROM pure_trade_commodities)
+            GROUP BY ship, commodity
+        ),
+        ship_cost AS (
+            SELECT ship, commodity, SUM(total_cost) AS total_cost
+            FROM market_buy
+            WHERE ship IS NOT NULL AND commodity IN (SELECT commodity FROM pure_trade_commodities)
+            GROUP BY ship, commodity
+        ),
+        ship_commodity_profit AS (
+            SELECT COALESCE(ss.ship, sc.ship) AS ship,
+                   COALESCE(ss.total_sale, 0) - COALESCE(sc.total_cost, 0) AS profit
+            FROM ship_sale ss
+            FULL OUTER JOIN ship_cost sc ON sc.ship = ss.ship AND sc.commodity = ss.commodity
+        )
+        SELECT ship, SUM(profit) AS total_profit
+        FROM ship_commodity_profit
+        GROUP BY ship
+        ORDER BY total_profit DESC
+    """)
+
+    mining_by_ship_all = query(f"""
+        WITH {PURE_TRADE_CTE},
+        mined_by_ship AS (
+            SELECT ship, regexp_replace(lower(raw->>'Type'), '^[$]|_name;$', '', 'g') AS commodity,
+                   COUNT(*) AS units_refined
+            FROM events
+            WHERE event = 'MiningRefined' AND ship IS NOT NULL
+            GROUP BY ship, commodity
+        )
+        SELECT ship, SUM(units_refined * COALESCE(p.avg_sell_price, 0)) AS total_value
+        FROM mined_by_ship mb
+        LEFT JOIN mining_sell_price p ON p.commodity = mb.commodity
+        GROUP BY ship
+        ORDER BY total_value DESC
+    """)
+
+    # Reconciliation check (functional-requirements.md 2.5/5.5): the
+    # fleet-wide pure-trade-profit total and the sum of every ship's
+    # per-ship pure-trade profit must be the same number. Surfaced in the
+    # response (not just asserted here) so the page can show this as the
+    # raw evidence for its own correctness claim, per section 0's "every
+    # heuristic must show its raw evidence."
+    ship_sum_trade_profit = sum(r["total_profit"] or 0 for r in trade_by_ship_all)
+
+    # 5. Raw evidence for the critical exclusion rule: commodities excluded
+    # from "pure trade" because this player has also mined them at some
+    # point, with how much MarketSell revenue that exclusion is keeping out
+    # of the trading figures (painite chief among them -- see the module
+    # docstring above).
+    excluded_mined_but_sold = query(f"""
+        WITH {PURE_TRADE_CTE},
+        sale_by_commodity AS (
+            SELECT commodity, SUM(total_sale) AS total_sale, SUM(units) AS units
+            FROM market_sell GROUP BY commodity
+        )
+        SELECT s.commodity, COALESCE(d.display, initcap(s.commodity)) AS display,
+               s.total_sale, s.units
+        FROM sale_by_commodity s
+        JOIN mined_commodities m ON m.commodity = s.commodity
+        LEFT JOIN commodity_display d ON d.commodity = s.commodity
+        ORDER BY s.total_sale DESC
+    """)
+
+    # Raw evidence for the second exclusion: commodities sold with zero
+    # recorded MarketBuy events ever (mission-reward/salvage/colonization
+    # cargo sold for a spurious "profit").
+    excluded_zero_buy = query(f"""
+        WITH {PURE_TRADE_CTE},
+        sale_by_commodity AS (
+            SELECT commodity, SUM(total_sale) AS total_sale, SUM(units) AS units
+            FROM market_sell GROUP BY commodity
+        )
+        SELECT s.commodity, COALESCE(d.display, initcap(s.commodity)) AS display,
+               s.total_sale, s.units
+        FROM sale_by_commodity s
+        LEFT JOIN commodity_display d ON d.commodity = s.commodity
+        WHERE s.commodity NOT IN (SELECT commodity FROM mined_commodities)
+          AND s.commodity NOT IN (SELECT commodity FROM bought_commodities)
+        ORDER BY s.total_sale DESC
+    """)
+
+    active_hours_by_category = {r["category"]: r["active_hours"] for r in active_hours}
+
+    return {
+        "credits_per_active_hour": [
+            {
+                "category": "Trading",
+                "credits": fleet_trade_profit_total,
+                "active_hours": active_hours_by_category.get("Trading", 0),
+            },
+            {
+                "category": "Mining",
+                "credits": fleet_mining_value_total,
+                "active_hours": active_hours_by_category.get("Mining", 0),
+            },
+        ],
+        "trade_commodities": trade_commodities,
+        "mining_commodities": mining_commodities,
+        "trade_by_ship": trade_by_ship_all[:10],
+        "mining_by_ship": mining_by_ship_all[:10],
+        "excluded_mined_but_sold": excluded_mined_but_sold,
+        "excluded_zero_buy": excluded_zero_buy,
+        "reconciliation": {
+            "fleet_total_pure_trade_profit": fleet_trade_profit_total,
+            "ship_sum_pure_trade_profit": ship_sum_trade_profit,
+        },
+    }
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
