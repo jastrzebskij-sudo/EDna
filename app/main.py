@@ -48,4 +48,86 @@ def overview():
     return {"sessions": n_sessions, "events": n_events, "ships": n_ships}
 
 
+# Best-known community-sourced dates for major game updates (Frontier hasn't
+# published a canonical list) -- used as reference lines on time-series
+# charts. See functional-requirements.md 2.1.
+GAME_UPDATES = [
+    {"date": "2015-12-15", "label": "Horizons"},
+    {"date": "2016-10-25", "label": "The Engineers"},
+    {"date": "2018-02-27", "label": "Beyond Ch.1"},
+    {"date": "2020-06-09", "label": "Fleet Carriers"},
+    {"date": "2021-05-19", "label": "Odyssey"},
+    {"date": "2025-03-27", "label": "Trailblazers/Colonisation"},
+]
+
+
+@app.get("/api/gameplay")
+def gameplay():
+    monthly = query("""
+        SELECT to_char(date_trunc('month', session_start), 'YYYY-MM') AS month,
+               COUNT(*) AS sessions,
+               SUM(duration_hours) AS hours
+        FROM sessions
+        GROUP BY 1
+        ORDER BY 1
+    """)
+
+    heatmap = query("""
+        SELECT EXTRACT(DOW FROM session_start)::int AS dow,
+               EXTRACT(HOUR FROM session_start)::int AS hour,
+               COUNT(*) AS n
+        FROM sessions
+        GROUP BY 1, 2
+    """)
+
+    activity_mix = query("""
+        SELECT to_char(date_trunc('month', "timestamp"), 'YYYY-MM') AS month,
+               category,
+               COUNT(*) AS n
+        FROM events
+        WHERE category IS NOT NULL AND category != 'Ambient'
+        GROUP BY 1, 2
+        ORDER BY 1
+    """)
+
+    # Valid-session window (0 < duration < 12h) per functional-requirements.md 1.1.
+    histogram = query("""
+        SELECT width_bucket(duration_hours, 0, 12, 12) AS bucket, COUNT(*) AS n
+        FROM sessions
+        WHERE duration_hours > 0 AND duration_hours < 12
+        GROUP BY 1
+        ORDER BY 1
+    """)
+
+    top_events = query("""
+        SELECT event, COUNT(*) AS n
+        FROM events
+        GROUP BY event
+        ORDER BY n DESC
+        LIMIT 40
+    """)
+
+    return {
+        "monthly": monthly,
+        "heatmap": heatmap,
+        "activity_mix": activity_mix,
+        "histogram": histogram,
+        "top_events": top_events,
+        "game_updates": GAME_UPDATES,
+    }
+
+
+@app.get("/api/gameplay/event-trend")
+def event_trend(event: str):
+    monthly = query("""
+        SELECT to_char(date_trunc('month', "timestamp"), 'YYYY-MM') AS month,
+               COUNT(*) AS n
+        FROM events
+        WHERE event = %s
+        GROUP BY 1
+        ORDER BY 1
+    """, (event,))
+    return {"event": event, "monthly": monthly}
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
