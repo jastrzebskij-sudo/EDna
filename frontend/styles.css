@@ -152,3 +152,45 @@ html, body {
   margin-bottom: 12px;
   max-width: 100%;
 }
+
+.ed-table-wrap {
+  overflow-x: auto;
+  margin-top: 12px;
+}
+
+.ed-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82em;
+}
+
+.ed-table th {
+  font-family: var(--ed-font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ed-orange);
+  text-align: left;
+  font-size: 0.78em;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--ed-border);
+  white-space: nowrap;
+}
+
+.ed-table td {
+  padding: 7px 14px;
+  border-bottom: 1px solid rgba(255, 128, 0, 0.08);
+  color: #d8cfc4;
+}
+
+.ed-table tbody tr:hover td {
+  background: rgba(255, 128, 0, 0.05);
+}
+
+.ed-flag-unnecessary { color: var(--ed-red-hostile); }
+.ed-flag-review { color: var(--ed-yellow-caution); }
+
+.ed-note {
+  font-size: 0.78em;
+  color: #8a8078;
+  margin-top: 10px;
+}
