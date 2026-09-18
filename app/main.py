@@ -1582,4 +1582,289 @@ def exploration():
     }
 
 
+# ---------------------------------------------------------------------------
+# Surface Activity (functional-requirements.md 2.7). Vehicle-state span
+# computation is the shared foundation for every feature on this tab: the
+# events table's own vehicle_state column (populated at migration time by
+# the 1.4 state machine over LaunchSRV/DockSRV/SRVDestroyed/Disembark/Embark)
+# is grouped into contiguous same-state runs per session via the exact
+# LAG()-plus-running-SUM() trick /api/ships uses for ship flight-hours (see
+# the comment on that query) -- tracking vehicle_state transitions instead of
+# ship-identity transitions. The one deliberate difference: a span's END here
+# is the START of the very next contiguous run (or session end for the last
+# run), not that run's own last event's timestamp. On-foot events are
+# comparatively sparse, so ending a span at its own last event would badly
+# undercount short excursions (functional-requirements.md 2.7 says this
+# explicitly) -- ending at the next boundary event's timestamp instead
+# captures the whole excursion, interior event density or not.
+#
+# Known gap (see follow-up-todo.md's open "vehicle-state default-to-SHIP"
+# item, confirmed to also reach this tab while building it): a session that
+# opens (LoadGame) mid-SRV/on-foot excursion, before any correcting boundary
+# event fires within that same session, has its opening stretch of events
+# wrongly tagged vehicle_state=SHIP -- so any real excursion time before the
+# first boundary event in such a session is invisible to this tab's SRV/FOOT
+# spans entirely (it falls into an excluded SHIP-state group instead).
+# Confirmed non-zero here: 121 BackpackChange + 1 CollectItems event
+# (on-foot-only actions -- they cannot fire from inside a ship) carry
+# vehicle_state=SHIP; see default_to_ship_gap_evidence below and the
+# follow-up-todo.md addendum.
+VEHICLE_SPANS_CTE = """
+    vehicle_events AS (
+        SELECT id, source_file, "timestamp", vehicle_state, event, category
+        FROM events
+        WHERE vehicle_state IS NOT NULL
+    ),
+    vehicle_tagged AS (
+        SELECT *,
+               CASE WHEN LAG(vehicle_state) OVER w IS DISTINCT FROM vehicle_state THEN 1 ELSE 0 END AS new_span
+        FROM vehicle_events
+        WINDOW w AS (PARTITION BY source_file ORDER BY "timestamp")
+    ),
+    vehicle_grouped AS (
+        SELECT *,
+               SUM(new_span) OVER (PARTITION BY source_file ORDER BY "timestamp"
+                                    ROWS UNBOUNDED PRECEDING) AS grp
+        FROM vehicle_tagged
+    ),
+    vehicle_span_bounds AS (
+        SELECT source_file, grp, vehicle_state, MIN("timestamp") AS span_start
+        FROM vehicle_grouped
+        GROUP BY source_file, grp, vehicle_state
+    ),
+    vehicle_span_next AS (
+        SELECT *,
+               LEAD(span_start) OVER (PARTITION BY source_file ORDER BY span_start) AS next_start
+        FROM vehicle_span_bounds
+    ),
+    vehicle_spans AS (
+        -- Zero-duration spans (two boundary events logged in the same
+        -- second) are dropped here, not left to distort per-span averages.
+        SELECT vsn.source_file, vsn.grp, vsn.vehicle_state, vsn.span_start,
+               COALESCE(vsn.next_start, sess.session_end) AS span_end
+        FROM vehicle_span_next vsn
+        JOIN sessions sess ON sess.source_file = vsn.source_file
+        WHERE vsn.vehicle_state IN ('SRV', 'FOOT')
+          AND COALESCE(vsn.next_start, sess.session_end) > vsn.span_start
+    )
+"""
+
+# Mission windows (functional-requirements.md 1.6): MissionAccepted to the
+# first of MissionCompleted/MissionFailed/MissionAbandoned, or that mission's
+# own Expiry when never resolved (~1% of missions -- confirmed live: 4,943
+# accepted vs. 4,937 resolved, 0.12%, and only 5 missions lack both a
+# resolution AND an Expiry, falling back to a zero-width window at their own
+# accepted_at -- a safe, conservative default). MissionAccepted's own Name
+# field (confirmed against real rows) is the raw mission-type token, e.g.
+# "Mission_Courier_Elections" / "MISSION_Salvage_Illegal" -- confirmed it
+# never carries the "_name" suffix itself (only MissionCompleted/Failed/
+# Abandoned's own Name field does, e.g. "Mission_Courier_Elections_name");
+# both the prefix and suffix are stripped here anyway, per spec, for
+# robustness against any format this hasn't been checked against.
+MISSION_WINDOWS_CTE = """
+    mission_accepted AS (
+        SELECT (raw->>'MissionID')::bigint AS mission_id,
+               "timestamp" AS accepted_at,
+               raw->>'Name' AS mission_name,
+               (raw->>'Expiry')::timestamp AS expiry
+        FROM events
+        WHERE event = 'MissionAccepted' AND raw ? 'MissionID'
+    ),
+    mission_resolved AS (
+        SELECT (raw->>'MissionID')::bigint AS mission_id, MIN("timestamp") AS resolved_at
+        FROM events
+        WHERE event IN ('MissionCompleted', 'MissionFailed', 'MissionAbandoned')
+          AND raw ? 'MissionID'
+        GROUP BY 1
+    ),
+    mission_windows AS (
+        SELECT ma.mission_id, ma.accepted_at, ma.mission_name,
+               COALESCE(mr.resolved_at, ma.expiry, ma.accepted_at) AS window_end
+        FROM mission_accepted ma
+        LEFT JOIN mission_resolved mr ON mr.mission_id = ma.mission_id
+    )
+"""
+
+# Excursion-to-mission overlap rule (functional-requirements.md 1.6/2.7): a
+# span counts as "under a mission" if it overlaps ANY active mission window
+# at all -- co-occurrence, not proof of causation, a real limitation stated
+# explicitly on the page rather than hidden. Bare CTE-body fragment chaining
+# both fragments above, same splicing convention as SESSION_NET_CREDITS_CTE.
+SURFACE_SPAN_MISSION_CTE = f"""
+    {VEHICLE_SPANS_CTE},
+    {MISSION_WINDOWS_CTE},
+    span_mission_overlap AS (
+        SELECT vs.source_file, vs.grp, vs.vehicle_state, vs.span_start, vs.span_end,
+               EXISTS (
+                   SELECT 1 FROM mission_windows mw
+                   WHERE mw.accepted_at < vs.span_end AND mw.window_end > vs.span_start
+               ) AS under_mission
+        FROM vehicle_spans vs
+    )
+"""
+
+# On-foot/SRV-specific category overrides (functional-requirements.md 2.7) --
+# scoped to THIS tab only, not the shared events.category map used
+# everywhere else. Checked first; any event not in this list falls back to
+# its already-computed category column.
+SURFACE_CATEGORY_CASE = """CASE
+                       WHEN vg.event = 'CommitCrime' THEN 'Combat'
+                       WHEN vg.event IN ('BackpackChange', 'CollectItems', 'DropItems',
+                                         'CollectCargo', 'ShipLocker', 'Backpack')
+                           THEN 'Looting/Inventory'
+                       WHEN vg.event = 'SuitLoadout' THEN 'Ship management'
+                       WHEN vg.event = 'DatalinkScan' THEN 'Exploration (deep)'
+                       WHEN vg.event IN ('LaunchSRV', 'DockSRV', 'Disembark', 'Embark',
+                                         'Touchdown', 'Liftoff')
+                           THEN 'Travel'
+                       ELSE COALESCE(vg.category, 'Other')
+                   END"""
+
+
+@app.get("/api/surface")
+def surface():
+    # All three metrics below (hours, category composition, mission-type
+    # overlap) share the same expensive foundation -- the vehicle_grouped
+    # window-function pass over ~2M events, plus the mission_windows/
+    # span_mission_overlap CTEs. Run as three separate queries this cost
+    # gets paid three times over (confirmed while building this: ~14-22s
+    # each). Combined into ONE query via UNION ALL instead: every shared CTE
+    # is referenced more than once, so Postgres auto-materializes each one
+    # rather than inlining/recomputing it per reference -- the whole
+    # endpoint costs about the same as one pass (~20s, in line with
+    # /api/ships' comparable flight-hours window-function query, already
+    # shipped at a similar cost). Rows are tagged by a `metric` discriminator
+    # column and split apart in Python below.
+    rows = query(f"""
+        WITH {SURFACE_SPAN_MISSION_CTE},
+        hours_metric AS (
+            SELECT 'hours' AS metric, vehicle_state, under_mission,
+                   NULL::text AS category, NULL::text AS mission_type,
+                   COUNT(*) AS n,
+                   SUM(EXTRACT(EPOCH FROM (span_end - span_start)) / 3600.0) AS hours
+            FROM span_mission_overlap
+            GROUP BY vehicle_state, under_mission
+        ),
+        -- Activity-category composition, faceted by (state x mission-status).
+        -- Ambient is excluded post-override, matching this report's usual
+        -- activity-mix default (functional-requirements.md 1.2) -- the
+        -- override list above already pulls the real on-foot/SRV activity
+        -- (looting, travel, combat, etc.) out of what would otherwise land
+        -- in Ambient; what's left tagged Ambient here is mostly Music-event
+        -- noise (about 7 percent of all on-foot/SRV events fleet-wide), not
+        -- a real activity.
+        composition_events AS (
+            SELECT smo.vehicle_state, smo.under_mission,
+                   {SURFACE_CATEGORY_CASE} AS category
+            FROM vehicle_grouped vg
+            JOIN span_mission_overlap smo ON smo.source_file = vg.source_file AND smo.grp = vg.grp
+        ),
+        composition_metric AS (
+            SELECT 'composition' AS metric, vehicle_state, under_mission, category,
+                   NULL::text AS mission_type, COUNT(*) AS n, NULL::double precision AS hours
+            FROM composition_events
+            WHERE category != 'Ambient'
+            GROUP BY 2, 3, 4
+        ),
+        -- Most common mission types overlapping an excursion, on-foot and
+        -- SRV side by side (top 10 each, picked in Python below) --
+        -- DISTINCT on (span, mission) first so a mission active across a
+        -- long excursion isn't multi-counted for that one excursion; a
+        -- mission overlapping several different excursions legitimately
+        -- counts once per excursion.
+        excursion_missions AS (
+            SELECT DISTINCT smo.source_file, smo.grp, smo.vehicle_state, mw.mission_id, mw.mission_name
+            FROM span_mission_overlap smo
+            JOIN mission_windows mw
+              ON mw.accepted_at < smo.span_end AND mw.window_end > smo.span_start
+            WHERE smo.under_mission
+        ),
+        mission_type_metric AS (
+            SELECT 'mission_type' AS metric, vehicle_state, NULL::boolean AS under_mission,
+                   NULL::text AS category,
+                   replace(regexp_replace(regexp_replace(mission_name, '^(Mission_|MISSION_|Chain_)', '', 'i'),
+                                          '_name$', '', 'i'), '_', ' ') AS mission_type,
+                   COUNT(*) AS n, NULL::double precision AS hours
+            FROM excursion_missions
+            GROUP BY 2, 5
+        )
+        SELECT * FROM hours_metric
+        UNION ALL SELECT * FROM composition_metric
+        UNION ALL SELECT * FROM mission_type_metric
+    """)
+    hours_rows = [r for r in rows if r["metric"] == "hours"]
+    composition_rows = [r for r in rows if r["metric"] == "composition"]
+    mission_type_rows = sorted(
+        (r for r in rows if r["metric"] == "mission_type"), key=lambda r: -r["n"]
+    )
+
+    # Raw evidence for the known vehicle-state default-to-SHIP gap (see the
+    # module comment above VEHICLE_SPANS_CTE) -- events that can only fire
+    # on foot but are tagged vehicle_state=SHIP, meaning some real on-foot
+    # time at the very start of a session is invisible to this tab's span
+    # computation entirely. Shown on the page rather than swept under the
+    # rug (functional-requirements.md 0: every heuristic shows its evidence).
+    default_gap_evidence = query("""
+        SELECT event, COUNT(*) AS n
+        FROM events
+        WHERE event IN ('BackpackChange', 'CollectItems', 'DropItems') AND vehicle_state = 'SHIP'
+        GROUP BY 1
+        ORDER BY 2 DESC
+    """)
+
+    hours_by_facet = {(r["vehicle_state"], r["under_mission"]): r for r in hours_rows}
+
+    def facet_hours(state, mission):
+        r = hours_by_facet.get((state, mission))
+        return {"hours": (r["hours"] or 0) if r else 0, "spans": r["n"] if r else 0}
+
+    foot_mission = facet_hours("FOOT", True)
+    foot_free = facet_hours("FOOT", False)
+    srv_mission = facet_hours("SRV", True)
+    srv_free = facet_hours("SRV", False)
+    foot_total = foot_mission["hours"] + foot_free["hours"]
+    srv_total = srv_mission["hours"] + srv_free["hours"]
+
+    # Top category per facet -- recomputed live from composition_rows above
+    # (functional-requirements.md 2.7: the narrative summary must be
+    # recomputed from live data, not hardcoded), used for "what that time is
+    # actually spent on" in the narrative.
+    def top_category(state, mission):
+        rows = [r for r in composition_rows if r["vehicle_state"] == state and r["under_mission"] == mission]
+        if not rows:
+            return None
+        return max(rows, key=lambda r: r["n"])["category"]
+
+    return {
+        "hours_summary": {
+            "on_foot": {
+                "mission_hours": foot_mission["hours"],
+                "free_hours": foot_free["hours"],
+                "total_hours": foot_total,
+                "mission_spans": foot_mission["spans"],
+                "free_spans": foot_free["spans"],
+                "pct_under_mission": (foot_mission["hours"] / foot_total * 100) if foot_total else 0,
+            },
+            "srv": {
+                "mission_hours": srv_mission["hours"],
+                "free_hours": srv_free["hours"],
+                "total_hours": srv_total,
+                "mission_spans": srv_mission["spans"],
+                "free_spans": srv_free["spans"],
+                "pct_under_mission": (srv_mission["hours"] / srv_total * 100) if srv_total else 0,
+            },
+        },
+        "composition": composition_rows,
+        "mission_types_on_foot": [r for r in mission_type_rows if r["vehicle_state"] == "FOOT"][:10],
+        "mission_types_srv": [r for r in mission_type_rows if r["vehicle_state"] == "SRV"][:10],
+        "narrative": {
+            "on_foot_mission_top_category": top_category("FOOT", True),
+            "on_foot_free_top_category": top_category("FOOT", False),
+            "srv_mission_top_category": top_category("SRV", True),
+            "srv_free_top_category": top_category("SRV", False),
+        },
+        "default_to_ship_gap_evidence": default_gap_evidence,
+    }
+
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

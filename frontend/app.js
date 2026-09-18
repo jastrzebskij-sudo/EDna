@@ -58,6 +58,8 @@ function renderTab(id) {
     renderEconomy(panel);
   } else if (id === "exploration") {
     renderExploration(panel);
+  } else if (id === "surface") {
+    renderSurface(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -1708,6 +1710,264 @@ function renderExplorationNarrative(panel, data) {
       div.appendChild(note);
     }
   }
+}
+
+// Draws a "N%" label centered in each segment of a stacked bar chart --
+// functional-requirements.md 2.7 wants the on-foot/SRV mission-vs-free hours
+// bar to show its % labels directly, and Chart.js has no built-in datalabels
+// support (no separate plugin is loaded anywhere else in this app). Reads a
+// per-dataset `pctLabels` array (same index as `data`) set by the caller,
+// same "small custom plugin" pattern as referenceLinesPlugin above.
+function stackedPercentLabelsPlugin() {
+  return {
+    id: "stackedPctLabels",
+    afterDatasetsDraw(chart) {
+      const { ctx } = chart;
+      ctx.save();
+      ctx.fillStyle = "#0a0908";
+      ctx.font = 'bold 11px "Titillium Web", sans-serif';
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      chart.data.datasets.forEach((ds, dsIndex) => {
+        if (!ds.pctLabels) return;
+        const meta = chart.getDatasetMeta(dsIndex);
+        meta.data.forEach((bar, i) => {
+          const pct = ds.pctLabels[i];
+          if (!ds.data[i] || pct === null || pct === undefined) return;
+          const pos = bar.getCenterPoint();
+          ctx.fillText(pct.toFixed(0) + "%", pos.x, pos.y);
+        });
+      });
+      ctx.restore();
+    },
+  };
+}
+
+function renderSurface(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading surface-activity data&hellip;</p></div>`;
+  fetch("/api/surface")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "panel";
+      note.innerHTML = `<h2>Surface Activity</h2>
+        <p>Every SRV/on-foot excursion below is a contiguous vehicle-state span: it starts at a boundary event
+        (<code>LaunchSRV</code>/<code>DockSRV</code>/<code>SRVDestroyed</code>/<code>Disembark</code>/<code>Embark</code>)
+        and runs to the <em>next</em> boundary event in the same session (or session end for the last span) &mdash;
+        deliberately not based on how many events happen inside it, since on-foot events are comparatively sparse
+        and density-based timing would badly undercount short excursions. Zero-duration spans (two boundary events
+        logged in the same second) are dropped rather than left to distort the averages below.</p>
+        <p class="ed-note"><strong>Real limitation:</strong> an excursion counts as "under a mission" if its time
+        span overlaps <em>any</em> active mission window at all (<code>MissionAccepted</code> to the first of
+        <code>MissionCompleted</code>/<code>MissionFailed</code>/<code>MissionAbandoned</code>, or that mission's
+        own <code>Expiry</code> if it was never resolved) &mdash; this is co-occurrence, not proof the mission
+        caused the excursion.</p>
+        ${data.default_to_ship_gap_evidence.length ? `
+        <p class="ed-note"><strong>Known data-quality gap:</strong> a session that opens mid-SRV/on-foot excursion,
+        before any correcting boundary event fires within that same session, has its opening stretch of events
+        wrongly tagged <code>vehicle_state = SHIP</code> &mdash; so some real excursion time at the very start of
+        such a session is invisible to the spans below (it falls into an excluded SHIP-state group instead).
+        Confirmed non-zero here: ${data.default_to_ship_gap_evidence.map((r) => `${r.n} ${r.event}`).join(", ")}
+        event(s) that can only fire on foot, carrying <code>vehicle_state = SHIP</code> anyway. See
+        follow-up-todo.md.</p>` : ""}`;
+      panel.appendChild(note);
+      renderSurfaceHours(panel, data);
+      renderSurfaceComposition(panel, data);
+      renderSurfaceMissionTypes(panel, data);
+      renderSurfaceNarrative(panel, data);
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/surface -- ${e}</p></div>`;
+    });
+}
+
+function renderSurfaceHours(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Total On-Foot &amp; SRV Hours</h2>
+    <p>Split into time under an active mission vs. free choice (no active mission), by total span duration.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, 300);
+
+  const h = data.hours_summary;
+  const labels = ["On Foot", "SRV"];
+  const missionHours = [h.on_foot.mission_hours, h.srv.mission_hours];
+  const freeHours = [h.on_foot.free_hours, h.srv.free_hours];
+  const missionPct = [h.on_foot.pct_under_mission, h.srv.pct_under_mission];
+  const freePct = [100 - h.on_foot.pct_under_mission, 100 - h.srv.pct_under_mission];
+
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Under active mission",
+          data: missionHours,
+          backgroundColor: CATEGORY_COLORS["Passengers/Missions"],
+          stack: "hrs",
+          pctLabels: missionPct,
+        },
+        {
+          label: "Free choice (no active mission)",
+          data: freeHours,
+          backgroundColor: "rgba(125, 147, 168, 0.65)",
+          stack: "hrs",
+          pctLabels: freePct,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true },
+        y: { stacked: true, title: { display: true, text: "Hours" } },
+      },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 10 } } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const pct = ctx.dataset.pctLabels[ctx.dataIndex];
+              return `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}h (${pct.toFixed(1)}%)`;
+            },
+          },
+        },
+      },
+    },
+    plugins: [stackedPercentLabelsPlugin()],
+  });
+  gameplayCharts.push(chart);
+
+  renderEdTable(div, [
+    { label: "State", key: "state" },
+    { label: "Mission Hours", render: (r) => r.mission_hours.toFixed(1) },
+    { label: "Free Hours", render: (r) => r.free_hours.toFixed(1) },
+    { label: "Total Hours", render: (r) => r.total_hours.toFixed(1) },
+    { label: "% Under Mission", render: (r) => r.pct_under_mission.toFixed(1) + "%" },
+    { label: "Mission Spans", key: "mission_spans" },
+    { label: "Free Spans", key: "free_spans" },
+  ], [
+    { state: "On Foot", ...h.on_foot },
+    { state: "SRV", ...h.srv },
+  ]);
+}
+
+function renderSurfaceComposition(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Activity Composition, On-Foot/SRV &times; Mission Status</h2>
+    <p>Share of events per facet. Uses a few on-foot/SRV-specific category overrides that apply only on this tab
+    (not the shared category map used everywhere else in this report): <code>CommitCrime</code> &rarr; Combat;
+    <code>BackpackChange</code>/<code>CollectItems</code>/<code>DropItems</code>/<code>CollectCargo</code>/
+    <code>ShipLocker</code>/<code>Backpack</code> &rarr; Looting/Inventory; <code>SuitLoadout</code> &rarr; Ship
+    management; <code>DatalinkScan</code> &rarr; Exploration (deep); <code>LaunchSRV</code>/<code>DockSRV</code>/
+    <code>Disembark</code>/<code>Embark</code>/<code>Touchdown</code>/<code>Liftoff</code> &rarr; Travel. Any event
+    not in this list falls back to its already-computed category. Ambient excluded, as elsewhere in this report.
+    Hover a facet for the full breakdown.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, 380);
+
+  const facets = [
+    { key: "FOOT|false", label: "On Foot / Free" },
+    { key: "FOOT|true", label: "On Foot / Mission" },
+    { key: "SRV|false", label: "SRV / Free" },
+    { key: "SRV|true", label: "SRV / Mission" },
+  ];
+  const byFacet = {};
+  data.composition.forEach((r) => {
+    const key = `${r.vehicle_state}|${r.under_mission}`;
+    byFacet[key] = byFacet[key] || {};
+    byFacet[key][r.category] = r.n;
+  });
+  const categories = [...new Set(data.composition.map((r) => r.category))];
+  const totals = Object.fromEntries(
+    facets.map((f) => [f.key, Object.values(byFacet[f.key] || {}).reduce((a, b) => a + b, 0)])
+  );
+
+  const datasets = categories.map((cat) => ({
+    label: cat,
+    data: facets.map((f) => {
+      const n = (byFacet[f.key] || {})[cat] || 0;
+      return totals[f.key] ? +((n / totals[f.key]) * 100).toFixed(2) : 0;
+    }),
+    backgroundColor: CATEGORY_COLORS[cat] || "#888",
+    stack: "mix",
+  }));
+
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: { labels: facets.map((f) => f.label), datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      scales: {
+        x: { stacked: true },
+        y: { stacked: true, max: 100, title: { display: true, text: "% of events" } },
+      },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 10 } } },
+        tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y}%` } },
+      },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderSurfaceMissionTypes(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Most Common Mission Types Overlapping an Excursion</h2>
+    <p>Top 10 each, on-foot and SRV side by side &mdash; how many distinct excursions (see the span computation
+    above) had at least one mission of that type active during them. Overlap in time only, not causation. Mission
+    names are normalized from the raw <code>MissionAccepted</code> event's own <code>Name</code> field by stripping
+    <code>Mission_</code>/<code>MISSION_</code>/<code>Chain_</code> prefixes and any <code>_name</code> suffix.</p>`;
+  panel.appendChild(div);
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex; gap:32px; flex-wrap:wrap;";
+  div.appendChild(wrap);
+
+  const footCol = document.createElement("div");
+  footCol.style.flex = "1 1 320px";
+  footCol.innerHTML = `<h3 style="font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:0;">On Foot</h3>`;
+  wrap.appendChild(footCol);
+  renderEdTable(footCol, [
+    { label: "Mission Type", key: "mission_type" },
+    { label: "Excursions", key: "n" },
+  ], data.mission_types_on_foot);
+
+  const srvCol = document.createElement("div");
+  srvCol.style.flex = "1 1 320px";
+  srvCol.innerHTML = `<h3 style="font-family:var(--ed-font-display);color:var(--ed-orange-dim);font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-top:0;">SRV</h3>`;
+  wrap.appendChild(srvCol);
+  renderEdTable(srvCol, [
+    { label: "Mission Type", key: "mission_type" },
+    { label: "Excursions", key: "n" },
+  ], data.mission_types_srv);
+}
+
+function renderSurfaceNarrative(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  const h = data.hours_summary;
+  const n = data.narrative;
+  const cat = (c) => c || "n/a";
+  div.innerHTML = `<h2>Narrative Summary</h2>
+    <p><strong>${h.on_foot.pct_under_mission.toFixed(1)}%</strong> of on-foot time
+    (${h.on_foot.total_hours.toFixed(1)} hours total, across ${h.on_foot.mission_spans + h.on_foot.free_spans}
+    excursions) overlapped an active mission window &mdash; that mission-overlapping time was spent mostly on
+    <strong>${cat(n.on_foot_mission_top_category)}</strong>. On-foot time with no active mission skews toward
+    <strong>${cat(n.on_foot_free_top_category)}</strong> instead.</p>
+    <p><strong>${h.srv.pct_under_mission.toFixed(1)}%</strong> of SRV time (${h.srv.total_hours.toFixed(1)} hours
+    total, across ${h.srv.mission_spans + h.srv.free_spans} excursions) overlapped an active mission window &mdash;
+    spent mostly on <strong>${cat(n.srv_mission_top_category)}</strong>. Free SRV time (no active mission) is also
+    predominantly <strong>${cat(n.srv_free_top_category)}</strong>.</p>
+    <p class="ed-note">Recomputed live from the data above on every page load &mdash; not hardcoded.</p>`;
+  panel.appendChild(div);
 }
 
 function tabIdFromHash() {
