@@ -145,6 +145,48 @@ REAL_SHIP_FILTER = (
     "AND ship !~* 'testbuggy|utilitysuit|explorationsuit|tacticalsuit'"
 )
 
+# A Died event's own shape decides opponent type (functional-requirements.md
+# 1.4/2.2/2.4): a Killers array with a "Cmdr <name>" entry -> Player; a
+# singular KillerName/KillerShip -> NPC; neither -> Self/Accident. Shared
+# between the Ships tab's deaths-by-ship split and Combat Analysis's
+# ship-combat-death table so both stay byte-for-byte consistent.
+#
+# Known gap (see follow-up-todo.md, Combat section): a small number of Died
+# events carry a *singular* KillerName that is itself "Cmdr <name>" (a
+# player kill logged without a Killers array) -- this rule only checks the
+# Killers-array shape, so those fall through to the NPC branch instead of
+# Player. Confirmed in the live data (2 ship-state deaths, both to the same
+# "Cmdr frank likes pie"); left as-is here to match the already-shipped
+# Ships tab behavior rather than silently diverging between tabs.
+DEATH_OPPONENT_TYPE_SQL = """CASE
+                   WHEN EXISTS (
+                       SELECT 1 FROM jsonb_array_elements(COALESCE(raw->'Killers', '[]'::jsonb)) k
+                       WHERE (k->>'Name') LIKE 'Cmdr %%'
+                   ) THEN 'Player'
+                   WHEN raw ? 'KillerName' OR raw ? 'KillerShip' THEN 'NPC'
+                   ELSE 'Self/Accident'
+               END"""
+
+# A ship's dominant activity category -- same "most events wins" rule as
+# Play Patterns' per-session dominant category (SESSION_DOMINANT_CATEGORY_CTE
+# above... well, below) and the frontend's dominantCategories() for the Ships
+# tab, just computed in SQL here since Combat Analysis's death table needs it
+# joined into a GROUP BY-free row set. Bare CTE-body fragment, same splicing
+# convention as SESSION_NET_CREDITS_CTE.
+SHIP_DOMINANT_CATEGORY_CTE = """
+    ship_category_counts AS (
+        SELECT ship, category, COUNT(*) AS n
+        FROM events
+        WHERE category IS NOT NULL AND category != 'Ambient' AND ship IS NOT NULL
+        GROUP BY ship, category
+    ),
+    ship_dominant_category AS (
+        SELECT DISTINCT ON (ship) ship, category AS dominant_category
+        FROM ship_category_counts
+        ORDER BY ship, n DESC, category ASC
+    )
+"""
+
 # Module role recognition (functional-requirements.md 1.5): ordered
 # substring match on the internal Elite `Item` name, first match wins.
 # Order matters -- utility-mount items share the `hpt_` prefix with real
@@ -326,19 +368,11 @@ def ships():
         GROUP BY ship
     """)
 
-    # Died's own shape decides opponent type (functional-requirements.md
-    # 1.4/2.2): a Killers array with a "Cmdr <name>" entry -> Player; a
-    # singular KillerName/KillerShip -> NPC; neither -> Self/Accident.
-    deaths = query("""
+    # Died's own shape decides opponent type -- see DEATH_OPPONENT_TYPE_SQL
+    # above (shared with Combat Analysis's death table).
+    deaths = query(f"""
         SELECT ship,
-               CASE
-                   WHEN EXISTS (
-                       SELECT 1 FROM jsonb_array_elements(COALESCE(raw->'Killers', '[]'::jsonb)) k
-                       WHERE (k->>'Name') LIKE 'Cmdr %%'
-                   ) THEN 'Player'
-                   WHEN raw ? 'KillerName' OR raw ? 'KillerShip' THEN 'NPC'
-                   ELSE 'Self/Accident'
-               END AS opponent_type,
+               {DEATH_OPPONENT_TYPE_SQL} AS opponent_type,
                COUNT(*) AS n
         FROM events
         WHERE event = 'Died' AND vehicle_state = 'SHIP'
@@ -594,6 +628,108 @@ def play_patterns():
         "efficiency": efficiency,
         "top_lucrative": top_lucrative,
         "top_longest": top_longest,
+    }
+
+
+@app.get("/api/combat")
+def combat():
+    # 1. Most common bounty-kill opponents, fleet-wide (top 20). Bounty
+    # vouchers are NPC-only (functional-requirements.md 2.2), vehicle_state
+    # == SHIP only. `Target` is the internal Elite name (e.g. "cobramkiii")
+    # and the stable grouping key -- present on every row. `Target_Localised`
+    # (e.g. "Cobra Mk III") is missing on ~1/3 of rows and occasionally an
+    # unresolved "$...;" localization token, so it's picked as a display-name
+    # override only when present and not one of those tokens.
+    bounty_opponents = query("""
+        SELECT raw->>'Target' AS target,
+               MAX(raw->>'Target_Localised') FILTER (
+                   WHERE COALESCE(raw->>'Target_Localised', '') != ''
+                     AND raw->>'Target_Localised' NOT LIKE '$%%'
+               ) AS target_localised,
+               COUNT(*) AS kills
+        FROM events
+        WHERE event = 'Bounty' AND vehicle_state = 'SHIP'
+        GROUP BY 1
+        ORDER BY kills DESC
+        LIMIT 20
+    """)
+
+    # 2. Opponent mix per ship -- raw ship x opponent-target counts. The
+    # top-8-ship x top-12-opponent-type cross-tab (functional-requirements.md
+    # 2.4) is built client-side from this flat list, the same "flat rows in,
+    # matrix in JS" pattern as the activity-mix charts elsewhere.
+    opponent_by_ship = query("""
+        SELECT ship, raw->>'Target' AS target, COUNT(*) AS n
+        FROM events
+        WHERE event = 'Bounty' AND vehicle_state = 'SHIP' AND ship IS NOT NULL
+        GROUP BY ship, target
+    """)
+
+    # 3 & 6. Every recorded ship-combat death: vehicle_state == SHIP and
+    # opponent_type is NPC or Player (excludes Self/Accident -- "ship
+    # combat" specifically). Joined to each ship's own dominant activity
+    # category for the overconfidence flag: a ship-combat death on a ship
+    # whose dominant activity is NOT Combat. killer_ship/killer_rank fall
+    # back from the singular KillerShip/KillerRank fields to the first
+    # Killers[] array entry when only that shape is present.
+    deaths = query(f"""
+        WITH {SHIP_DOMINANT_CATEGORY_CTE},
+        classified AS (
+            SELECT ship, "timestamp",
+                   COALESCE(NULLIF(raw->>'KillerShip', ''), raw->'Killers'->0->>'Ship') AS killer_ship,
+                   COALESCE(NULLIF(raw->>'KillerRank', ''), raw->'Killers'->0->>'Rank') AS killer_rank,
+                   {DEATH_OPPONENT_TYPE_SQL} AS opponent_type
+            FROM events
+            WHERE event = 'Died' AND vehicle_state = 'SHIP'
+        )
+        SELECT c.ship, c."timestamp", c.killer_ship, c.killer_rank, c.opponent_type,
+               COALESCE(dc.dominant_category, 'Other') AS dominant_category,
+               COALESCE(dc.dominant_category, 'Other') != 'Combat' AS overconfident
+        FROM classified c
+        LEFT JOIN ship_dominant_category dc ON dc.ship = c.ship
+        WHERE c.opponent_type != 'Self/Accident'
+        ORDER BY c."timestamp"
+    """)
+
+    # 4. Interdiction exposure by ship (top 15): the `Interdicted` event
+    # fires when the player is the one interdicted (as opposed to the much
+    # rarer `Interdiction` event, which is the player interdicting someone
+    # else -- not "exposure" and not used here). Its own `Submitted` boolean
+    # says whether the player submitted rather than fighting/escaping.
+    interdiction_exposure = query("""
+        SELECT ship,
+               COUNT(*) AS times_interdicted,
+               COUNT(*) FILTER (WHERE (raw->>'Submitted')::boolean) AS times_submitted
+        FROM events
+        WHERE event = 'Interdicted' AND vehicle_state = 'SHIP' AND ship IS NOT NULL
+        GROUP BY ship
+        ORDER BY times_interdicted DESC
+        LIMIT 15
+    """)
+
+    # 5. Near-death events by ship (top 15): HullDamage with Health < 0.25,
+    # vehicle_state == SHIP, and the event's own PlayerPilot == true (a
+    # HullDamage event can fire for an NPC crew member or fighter pilot
+    # instead of the commander -- PlayerPilot is false then).
+    near_death = query("""
+        SELECT ship, COUNT(*) AS near_deaths
+        FROM events
+        WHERE event = 'HullDamage'
+          AND vehicle_state = 'SHIP'
+          AND (raw->>'Health')::double precision < 0.25
+          AND (raw->>'PlayerPilot')::boolean = true
+          AND ship IS NOT NULL
+        GROUP BY ship
+        ORDER BY near_deaths DESC
+        LIMIT 15
+    """)
+
+    return {
+        "bounty_opponents": bounty_opponents,
+        "opponent_by_ship": opponent_by_ship,
+        "deaths": deaths,
+        "interdiction_exposure": interdiction_exposure,
+        "near_death": near_death,
     }
 
 

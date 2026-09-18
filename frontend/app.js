@@ -52,6 +52,8 @@ function renderTab(id) {
     renderShips(panel);
   } else if (id === "play-patterns") {
     renderPlayPatterns(panel);
+  } else if (id === "combat") {
+    renderCombat(panel);
   } else {
     const tab = TABS.find((t) => t.id === id);
     panel.innerHTML = `
@@ -948,6 +950,214 @@ function renderTopSessions(panel, data) {
   h3b.style.cssText = h3a.style.cssText;
   div.appendChild(h3b);
   renderEdTable(div, cols, data.top_longest);
+}
+
+// Prettifies an internal Elite ship-type slug (e.g. "empire_eagle") into a
+// readable fallback when no Target_Localised/display name is on hand --
+// used for both Bounty opponent targets and Died killer ships, which share
+// the same internal naming convention. Never hides the raw value: callers
+// put it in a title attribute alongside this.
+function prettifyShipSlug(slug) {
+  if (!slug) return "unrecorded";
+  return slug
+    .split(/[_\s]+/)
+    .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+function renderCombat(panel) {
+  panel.innerHTML = `<div class="panel"><p>Loading combat data&hellip;</p></div>`;
+  fetch("/api/combat")
+    .then((r) => r.json())
+    .then((data) => {
+      panel.innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "panel";
+      note.innerHTML = `<h2>Combat Analysis</h2>
+        <p class="ed-note">All counts below are raw totals, not per-hour rates -- cross-reference with the Ship Profile Analysis tab's flight-hours if a rate is wanted. Scoped to vehicle_state == SHIP throughout.</p>`;
+      panel.appendChild(note);
+      renderBountyOpponents(panel, data);
+      renderOpponentMixPerShip(panel, data);
+      renderShipCombatDeaths(panel, data);
+      renderInterdictionExposure(panel, data);
+      renderNearDeath(panel, data);
+      renderOverconfidenceNarrative(panel, data);
+    })
+    .catch((e) => {
+      panel.innerHTML = `<div class="panel"><p>Couldn't reach /api/combat -- ${e}</p></div>`;
+    });
+}
+
+// Shared display-name lookup for Bounty opponent targets (internal Elite
+// slug -> Target_Localised when known) -- reused for the opponent-mix table
+// and the overconfidence narrative's killer-ship naming, since Died's
+// KillerShip uses the same internal slugs as Bounty's Target.
+function bountyTargetLabel(row) {
+  return row.target_localised || prettifyShipSlug(row.target);
+}
+
+function renderBountyOpponents(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Most Common Bounty-Kill Opponents, Fleet-Wide</h2><p>Top 20 by kill count, from Bounty vouchers (NPC-only) &mdash; vehicle_state == SHIP.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(240, data.bounty_opponents.length * 22));
+
+  const rows = data.bounty_opponents;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => bountyTargetLabel(r)),
+      datasets: [{
+        label: "Kills",
+        data: rows.map((r) => r.kills),
+        backgroundColor: "rgba(255, 43, 43, 0.6)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { afterLabel: (ctx) => `raw Target: ${rows[ctx.dataIndex].target}` } },
+      },
+      scales: { x: { title: { display: true, text: "Kills" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderOpponentMixPerShip(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Opponent Mix per Ship</h2><p>Top 8 ships by bounty-kill count &times; top 12 opponent types fleet-wide. Values = kill counts.</p>`;
+  panel.appendChild(div);
+
+  const shipTotals = {};
+  data.opponent_by_ship.forEach((r) => {
+    shipTotals[r.ship] = (shipTotals[r.ship] || 0) + r.n;
+  });
+  const top8Ships = Object.entries(shipTotals).sort((a, b) => b[1] - a[1]).slice(0, 8).map((e) => e[0]);
+  const top12Targets = data.bounty_opponents.slice(0, 12);
+  const labelByTarget = Object.fromEntries(top12Targets.map((r) => [r.target, bountyTargetLabel(r)]));
+
+  const matrix = {};
+  data.opponent_by_ship.forEach((r) => {
+    if (!top8Ships.includes(r.ship)) return;
+    matrix[r.ship] = matrix[r.ship] || {};
+    matrix[r.ship][r.target] = r.n;
+  });
+
+  const rows = top8Ships.map((ship) => {
+    const row = { ship };
+    top12Targets.forEach((t) => { row[t.target] = (matrix[ship] || {})[t.target] || 0; });
+    return row;
+  });
+
+  const columns = [{ label: "Ship", key: "ship" }].concat(
+    top12Targets.map((t) => ({ label: labelByTarget[t.target], render: (r) => r[t.target] || 0 }))
+  );
+  renderEdTable(div, columns, rows);
+}
+
+function renderShipCombatDeaths(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Every Recorded Ship-Combat Death</h2>
+    <p>vehicle_state == SHIP, opponent NPC or Player (excludes Self/Accident and on-foot/SRV losses). "Overconfident" = the ship's own dominant activity category is not Combat -- shown alongside the raw dominant-activity evidence, not asserted alone.</p>`;
+  panel.appendChild(div);
+
+  renderEdTable(div, [
+    { label: "Date", render: (r) => r.timestamp.slice(0, 10) },
+    { label: "Ship", key: "ship" },
+    {
+      label: "Killer Ship",
+      render: (r) => `<span title="raw: ${r.killer_ship || ""}">${prettifyShipSlug(r.killer_ship)}</span>`,
+    },
+    { label: "Killer Rank", render: (r) => r.killer_rank || "unrecorded" },
+    { label: "Opponent", key: "opponent_type" },
+    { label: "Ship's Dominant Activity", key: "dominant_category" },
+    {
+      label: "Overconfidence Flag",
+      render: (r) => (r.overconfident ? '<span class="ed-flag-unnecessary">Overconfident</span>' : ""),
+    },
+  ], data.deaths);
+}
+
+function renderInterdictionExposure(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Interdiction Exposure by Ship</h2><p>Top 15. "Submitted" = didn't fight/flee first (Interdicted event's own Submitted field). vehicle_state == SHIP.</p>`;
+  panel.appendChild(div);
+
+  renderEdTable(div, [
+    { label: "Ship", key: "ship" },
+    { label: "Times Interdicted", key: "times_interdicted" },
+    { label: "Times Submitted", key: "times_submitted" },
+    {
+      label: "Submit Rate",
+      render: (r) => (r.times_interdicted ? ((r.times_submitted / r.times_interdicted) * 100).toFixed(1) + "%" : "--"),
+    },
+  ], data.interdiction_exposure);
+}
+
+function renderNearDeath(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Near-Death Events by Ship</h2><p>Top 15. HullDamage events with Health &lt; 25%, vehicle_state == SHIP, PlayerPilot == true -- an independent "got into real danger" signal regardless of whether the ship was actually lost.</p>`;
+  panel.appendChild(div);
+  const canvas = chartCanvas(div, Math.max(220, data.near_death.length * 22));
+
+  const rows = data.near_death;
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: rows.map((r) => r.ship),
+      datasets: [{
+        label: "Near-death events",
+        data: rows.map((r) => r.near_deaths),
+        backgroundColor: "rgba(255, 204, 0, 0.6)",
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { title: { display: true, text: "Near-death events" } } },
+    },
+  });
+  gameplayCharts.push(chart);
+}
+
+function renderOverconfidenceNarrative(panel, data) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `<h2>Overconfidence Instances</h2><p>Every flagged overconfidence death spelled out: a ship whose dominant activity is not Combat, lost to ship-to-ship combat anyway.</p>`;
+  panel.appendChild(div);
+
+  const instances = data.deaths.filter((r) => r.overconfident);
+  if (!instances.length) {
+    const note = document.createElement("p");
+    note.className = "ed-note";
+    note.textContent = "No overconfidence deaths flagged in the data.";
+    div.appendChild(note);
+    return;
+  }
+
+  const ul = document.createElement("ul");
+  ul.style.cssText = "color:#d8cfc4; line-height:1.7; padding-left:20px; margin:12px 0 0 0;";
+  instances.forEach((r) => {
+    const li = document.createElement("li");
+    const date = r.timestamp.slice(0, 10);
+    const killerShip = prettifyShipSlug(r.killer_ship);
+    const rank = r.killer_rank || "unrecorded-rank";
+    const article = (w) => (/^[aeiou]/i.test(w) ? "an" : "a");
+    li.innerHTML = `<strong>${date}</strong> &mdash; <em>${r.ship}</em> (usually flown for ${r.dominant_category}) was destroyed by ${article(rank)} ${rank} ${r.opponent_type === "Player" ? "player" : "NPC"} in ${article(killerShip)} ${killerShip}.`;
+    ul.appendChild(li);
+  });
+  div.appendChild(ul);
 }
 
 function tabIdFromHash() {
